@@ -1,0 +1,49 @@
+name: test_mc_denoising
+suffix: ~
+scale: 4
+model_type: RefRestorationModel
+set_CUDA_VISIBLE_DEVICES: ~
+crop_border: 4
+gpu_ids: [0]
+
+datasets:
+  test_0:
+    name: val_MCDenoising
+    type: MCDenoisingDataset
+    dataroot_in: datasets/DenosingDataset/test/input_16spp
+    dataroot_ref: datasets/DenosingDataset/test/ref
+    dataroot_albedo: datasets/DenosingDataset/test/albedo
+    io_backend:
+      type: disk
+    gt_size: 160
+
+val_func: BasicSRValidation
+save_img: true
+
+network_g:
+  type: DenoiseSwinUnetv3RestorationNet
+  ngf: 64
+  n_blocks: 4
+  groups: 4
+  embed_dim: 64
+  depths: [2, 2]
+  num_heads: [4, 4]
+  window_size: 4
+  use_checkpoint: True
+  denoise_nf: 64
+  denoise_blocks: 4
+  denoise_in_nc: 6
+network_map:
+  type: FlowSimCorrespondenceGenerationArch
+  patch_size: 3
+  stride: 1
+  vgg_layer_list: ['relu1_1', 'relu2_1', 'relu3_1']
+  vgg_type: 'vgg19'
+network_extractor:
+  type: ContrasExtractorSep
+
+path:
+  pretrain_model_g: experiments/train/denoising_16spp2/models/net_g_95000.pth
+  pretrain_model_feature_extractor: experiments/pretrained_model/feature_extraction.pth
+  strict_load: true
+  root: experiments/test/denosing_16spp2/

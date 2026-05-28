@@ -1,0 +1,115 @@
+name: train_parallel_dual_branch_ablation_p0
+use_tb_logger: true
+model_type: WaveletParallelRestorationModel
+map_type: online_CUFED_swap
+scale: 4
+crop_border: ~
+set_CUDA_VISIBLE_DEVICES: ~
+gpu_ids: [0]
+
+datasets:
+  train:
+    name: CUFED
+    type: NoisyRefCUFEDDataset
+    dataroot_in: ./datasets/CUFED_noisy/input_noisy_sigma50
+    dataroot_ref: ./datasets/CUFED/ref
+    dataroot_gt: ./datasets/CUFED/input
+    io_backend:
+      type: disk
+    gt_size: 160
+    use_flip: true
+    use_rot: true
+    bicubic_model: PIL
+    use_shuffle: true
+    n_workers: 2
+    batch_size: 2
+    dataset_enlarge_ratio: 1000
+
+  val:
+    name: val_CUFED
+    type: NoisyRefCUFEDDataset
+    dataroot_in: ./datasets/CUFED5
+    dataroot_ref: ./datasets/CUFED5
+    dataroot_gt: ./datasets/CUFED5
+    io_backend:
+      type: disk
+    ann_file: ./datasets/CUFED5_pairs.txt
+    bicubic_model: PIL
+    noise_sigma: 0
+
+network_g:
+  type: WaveletParallelRestorationNet
+  ngf: 64
+  n_blocks: 2
+  groups: 2
+  embed_dim: 32
+  depths: [2, 2]
+  num_heads: [2, 2]
+  window_size: 8
+  use_checkpoint: true
+  use_wdm: true
+
+  # P1: set true to match references from WDM-denoised LR.
+  use_denoised_matching: false
+
+  # P2: set true to inject aligned reference high-frequency wavelet bands.
+  use_ref_frequency: false
+
+  # P3: set true to use similarity-aware spatial/frequency fusion.
+  use_similarity_gate: false
+
+network_map:
+  type: FlowSimCorrespondenceGenerationArch
+  patch_size: 3
+  stride: 1
+  vgg_layer_list: ['relu1_1', 'relu2_1', 'relu3_1']
+  vgg_type: 'vgg19'
+  use_freq_matching: true
+
+network_extractor:
+  type: ContrasExtractorSep
+
+path:
+  pretrain_model_g: ~
+  pretrain_model_feature_extractor: experiments/pretrained_model/feature_extraction.pth
+  strict_load: false
+  resume_state: ~
+  root: experiments/train/
+
+train:
+  lr_g: !!float 1e-4
+  lr_offset: !!float 1e-4
+  lr_relu2_offset: !!float 1e-5
+  lr_relu3_offset: !!float 1e-6
+  weight_decay_g: 0
+  beta_g: [0.9, 0.999]
+  lr_scheme: MultiStepLR
+
+  niter: 50000
+  warmup_iter: -1
+  net_g_pretrain_steps: 0
+  lr_steps: [30000, 45000]
+  lr_gamma: 0.1
+
+  pixel_criterion: L1Loss
+  pixel_weight: !!float 1.0
+
+  # P4: keep these at 0 for the P0 baseline, then restore the full-config
+  # denoise/mask/wavelet/fft losses for the P4 run.
+  mask_sparse_opt:
+    loss_weight: !!float 0.0
+  denoise_weight: !!float 0.0
+
+  manual_seed: 10
+
+val:
+  val_freq: !!float 5e3
+  save_img: False
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: !!float 5e3
+
+dist_params:
+  backend: nccl
+  port: 29746

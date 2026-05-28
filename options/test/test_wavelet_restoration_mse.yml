@@ -1,0 +1,61 @@
+# options/test/test_wavelet_restoration_mse.yml
+name: test_wavelet_restoration_mse2
+suffix: ~
+scale: 4
+model_type: RefRestorationModel
+set_CUDA_VISIBLE_DEVICES: ~
+crop_border: ~
+gpu_ids: [0]
+
+datasets:
+  test_0:
+    name: val_CUFED_noisy
+    type: NoisyRefCUFEDDataset
+    dataroot_in: ./datasets/CUFED5_sigma50
+    # dataroot_in: ./datasets/CUFED5
+    dataroot_ref: ./datasets/CUFED5
+    dataroot_gt: ./datasets/CUFED5
+    io_backend:
+      type: disk
+    bicubic_model: PIL
+    ann_file: ./datasets/CUFED5_pairs.txt
+    noise_sigma: 0
+#    noise_sigma: 0.196  # 50/255, 测试时使用固定噪声
+
+#val_func: BasicSRValidation
+save_img: true
+
+# network structures
+network_g:
+  type: NewSwinUnetv3RestorationNet
+  ngf: 128
+  n_blocks: 8
+  groups: 8
+  embed_dim: 128
+  depths: [4,4]
+  num_heads: [4,4]
+  window_size: 8
+  use_checkpoint: True
+  wav_channels: 64
+  K: 1
+  legacy_wav_concat: true
+network_map:
+  type: FlowSimCorrespondenceGenerationArch
+  patch_size: 3
+  stride: 1
+  vgg_layer_list: ['relu1_1', 'relu2_1', 'relu3_1']
+  vgg_type: 'vgg19'
+network_extractor:
+  type: ContrasExtractorSep
+
+network_wavelet:
+  type: WaveletFrequencyBranch
+  out_channels: 64
+
+# path
+path:
+  pretrain_model_g: experiments/train/train_wavelet_restoration_mse2/models/net_g_50000.pth
+  pretrain_model_feature_extractor: experiments/pretrained_model/feature_extraction.pth
+  pretrain_model_wavelet: experiments/train/train_wavelet_restoration_mse2/models/net_wavelet_50000.pth
+  strict_load: true
+  root: experiments/test/wavelet

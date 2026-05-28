@@ -1,0 +1,63 @@
+# Stage C test: Stage B + zero-init aligned reference high-frequency residual.
+name: test_datsr_wavelet_ref_hf_noisy
+suffix: ~
+scale: 4
+model_type: RefRestorationModel
+set_CUDA_VISIBLE_DEVICES: ~
+crop_border: ~
+gpu_ids: [0]
+
+datasets:
+  test_0:
+    name: CUFED5_sigma50
+    type: NoisyRefCUFEDDataset
+    dataroot_in: ./datasets/CUFED5_sigma50
+    dataroot_ref: ./datasets/CUFED5
+    dataroot_gt: ./datasets/CUFED5
+    io_backend:
+      type: disk
+    bicubic_model: PIL
+    ann_file: ./datasets/CUFED5_pairs.txt
+    noise_sigma: 0
+
+save_img: true
+collect_hf_stats: true
+
+network_g:
+  type: NewSwinUnetv3RestorationNet
+  ngf: 128
+  n_blocks: 8
+  groups: 8
+  embed_dim: 128
+  depths: [4, 4]
+  num_heads: [4, 4]
+  window_size: 8
+  use_checkpoint: true
+  wav_channels: 64
+  K: 1
+  use_wavelet_ll_matching: true
+  use_ref_hf_residual: true
+  use_similarity_gate: false
+  zero_init_ref_hf: true
+  legacy_wav_concat: false
+
+network_map:
+  type: FlowSimCorrespondenceGenerationArch
+  patch_size: 3
+  stride: 1
+  vgg_layer_list: ['relu1_1', 'relu2_1', 'relu3_1']
+  vgg_type: 'vgg19'
+
+network_extractor:
+  type: ContrasExtractorSep
+
+network_wavelet:
+  type: WaveletFrequencyBranch
+  out_channels: 64
+
+path:
+  pretrain_model_g: experiments/train/train_datsr_wavelet_ref_hf_noisy/models/net_g_latest.pth
+  pretrain_model_feature_extractor: experiments/pretrained_model/feature_extraction.pth
+  pretrain_model_wavelet: experiments/train/train_datsr_wavelet_ref_hf_noisy/models/net_wavelet_latest.pth
+  strict_load: true
+  root: experiments/test/

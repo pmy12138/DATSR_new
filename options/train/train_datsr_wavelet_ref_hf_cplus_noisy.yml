@@ -1,0 +1,118 @@
+# Stage C+: Stage B + bounded nonzero aligned reference high-frequency residual.
+name: train_datsr_wavelet_ref_hf_cplus_noisy
+use_tb_logger: true
+model_type: RefRestorationModel
+map_type: online_CUFED_swap
+scale: 4
+crop_border: ~
+set_CUDA_VISIBLE_DEVICES: ~
+gpu_ids: [0]
+
+datasets:
+  train:
+    name: CUFED_noisy
+    type: NoisyRefCUFEDDataset
+    dataroot_in: ./datasets/CUFED_noisy/input_noisy_sigma50
+    dataroot_ref: ./datasets/CUFED/ref
+    dataroot_gt: ./datasets/CUFED/input
+    io_backend:
+      type: disk
+    gt_size: 160
+    use_flip: true
+    use_rot: true
+    use_ColorJitter: false
+    scale: 4
+    use_shuffle: true
+    n_workers: 2
+    batch_size: 2
+    dataset_enlarge_ratio: 1000
+
+  val:
+    name: CUFED5_sigma50
+    type: NoisyRefCUFEDDataset
+    dataroot_in: ./datasets/CUFED5_sigma50
+    dataroot_ref: ./datasets/CUFED5
+    dataroot_gt: ./datasets/CUFED5
+    io_backend:
+      type: disk
+    use_ColorJitter: false
+    ann_file: ./datasets/CUFED5_pairs.txt
+    scale: 4
+
+network_g:
+  type: NewSwinUnetv3RestorationNet
+  ngf: 128
+  n_blocks: 8
+  groups: 8
+  embed_dim: 128
+  depths: [4, 4]
+  num_heads: [4, 4]
+  window_size: 8
+  use_checkpoint: true
+  wav_channels: 64
+  K: 1
+  use_wavelet_ll_matching: true
+  use_ref_hf_residual: true
+  use_similarity_gate: false
+  zero_init_ref_hf: false
+  init_ref_hf_scale: 0.05
+  max_ref_hf_scale: 0.05
+  legacy_wav_concat: false
+
+network_map:
+  type: FlowSimCorrespondenceGenerationArch
+  patch_size: 3
+  stride: 1
+  vgg_layer_list: ['relu1_1', 'relu2_1', 'relu3_1']
+  vgg_type: 'vgg19'
+
+network_extractor:
+  type: ContrasExtractorSep
+
+network_wavelet:
+  type: WaveletFrequencyBranch
+  out_channels: 64
+
+path:
+  pretrain_model_g: experiments/train/train_datsr_wavelet_ll_matching_noisy/models/net_g_latest.pth
+  pretrain_model_d: ~
+  pretrain_model_feature_extractor: experiments/pretrained_model/feature_extraction.pth
+  pretrain_model_wavelet: ~
+  strict_load: false
+  resume_state: ~
+  root: experiments/train/
+
+train:
+  lr_g: !!float 5e-5
+  lr_offset: !!float 5e-5
+  lr_relu2_offset: !!float 5e-6
+  lr_relu3_offset: !!float 5e-7
+  lr_wavelet: !!float 2e-4
+  weight_decay_g: 0
+  beta_g: [0.9, 0.999]
+  lr_d: !!float 1e-4
+  weight_decay_d: 0
+  beta_d: [0.9, 0.999]
+  lr_scheme: MultiStepLR
+  niter: 100000
+  warmup_iter: -1
+  net_g_pretrain_steps: 0
+  lr_steps: [30000, 50000]
+  lr_gamma: 0.1
+  pixel_criterion: L1Loss
+  pixel_weight: !!float 1.0
+  manual_seed: 10
+  net_d_steps: 1
+  net_d_init_steps: 0
+
+val:
+  val_freq: !!float 5e3
+  save_img: false
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: !!float 5e3
+
+dist_params:
+  backend: nccl
+  port: 29749

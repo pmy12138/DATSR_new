@@ -1,0 +1,52 @@
+name: test_parallel_dual_branch_old250k_val
+suffix: ~
+scale: 4
+model_type: WaveletParallelRestorationModel
+set_CUDA_VISIBLE_DEVICES: ~
+crop_border: 4
+gpu_ids: [0]
+
+datasets:
+  test_0:
+    name: val_CUFED
+    type: RefCUFEDDataset
+    dataroot_in: ./datasets/CUFED5
+    dataroot_ref: ./datasets/CUFED5
+    io_backend:
+      type: disk
+    bicubic_model: PIL
+    ann_file: ./datasets/CUFED5_pairs.txt
+    noise_sigma: 0
+
+val_func: BasicSRValidation
+save_img: false
+
+network_g:
+  type: OldWaveletParallelRestorationNet
+  ngf: 128
+  n_blocks: 8
+  groups: 8
+  embed_dim: 128
+  depths: [4, 4]
+  num_heads: [4, 4]
+  window_size: 8
+  use_checkpoint: true
+  use_wdm: true
+  use_denoised_matching: false
+
+network_map:
+  type: FlowSimCorrespondenceGenerationArch
+  patch_size: 3
+  stride: 1
+  vgg_layer_list: ['relu1_1', 'relu2_1', 'relu3_1']
+  vgg_type: 'vgg19'
+  use_freq_matching: true
+
+network_extractor:
+  type: ContrasExtractorSep
+
+path:
+  pretrain_model_g: experiments/train/train_parallel_dual_branch_3090/models/net_g_250000.pth
+  pretrain_model_feature_extractor: experiments/pretrained_model/feature_extraction.pth
+  strict_load: true
+  root: experiments/test/
