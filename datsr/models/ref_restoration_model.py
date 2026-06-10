@@ -13,7 +13,7 @@ import datsr.utils.metrics as metrics
 from datsr.utils import ProgressBar, tensor2img, img2tensor
 
 from .sr_model import SRModel
-from datsr.models.archs.wavelet_branch_arch import WaveletFrequencyBranch, upsample_offsets
+from datsr.models.archs.wavelet_branch_arch import upsample_offsets
 import pdb
 
 loss_module = importlib.import_module('datsr.models.losses')
@@ -36,13 +36,16 @@ class RefRestorationModel(SRModel):
         self.print_network(self.net_extractor)
 
         # ===== 新增: 小波频域分支 =====  
-        self.net_wavelet = WaveletFrequencyBranch(out_channels=64).to(self.device)
+        self.net_wavelet = networks.define_net_wavelet(opt)
+        self.net_wavelet = self.model_to_device(self.net_wavelet)
         net_g_opt = self.opt.get('network_g', {})
         legacy_wav_concat = net_g_opt.get('legacy_wav_concat', False)
         self.use_wavelet_ll_matching = net_g_opt.get(
             'use_wavelet_ll_matching', False)
         self.use_ref_hf_residual = net_g_opt.get(
             'use_ref_hf_residual', False) or legacy_wav_concat
+        self.use_feature_wavelet_matching = net_g_opt.get(
+            'use_feature_wavelet_matching', False)
 
         # load pretrained feature extractor  
         load_path = self.opt['path'].get('pretrain_model_feature_extractor',
@@ -217,6 +220,10 @@ class RefRestorationModel(SRModel):
         if 'img_in_ori' in data:
             self.gt_ori = data['img_in_ori'].to(self.device)
 
+    def _get_net_wavelet_module(self):
+        return (self.net_wavelet.module
+                if hasattr(self.net_wavelet, 'module') else self.net_wavelet)
+
     def _legacy_wavelet_forward(self):
         """小波频域分支的前向传播  
 
@@ -252,7 +259,8 @@ class RefRestorationModel(SRModel):
 
         # Step 4: 用 relu1_1 flow (80x80) warp Ref 高频子带  
         # pre_flow['relu1_1'] 与 highfreq_r 分辨率一致 (都是 80x80)  
-        F_wav = self.net_wavelet.warp_highfreq(highfreq_r, pre_flow['relu1_1'])
+        net_wavelet = self._get_net_wavelet_module()
+        F_wav = net_wavelet.warp_highfreq(highfreq_r, pre_flow['relu1_1'])
         # F_wav: (B, 64, 80, 80)  
 
         # Step 5: Offset/Flow/Similarity 上采样 ×2 (从 LL 分辨率恢复到原始分辨率)  
@@ -273,14 +281,28 @@ class RefRestorationModel(SRModel):
         """Build correspondence and optional aligned reference HF features."""
         highfreq_r = None
         needs_upsample = False
+        wavelet_features = None
+        net_wavelet = self._get_net_wavelet_module()
 
         if self.use_wavelet_ll_matching:
-            ll_y, ll_r, highfreq_r = self.net_wavelet(
-                self.match_img_in, self.img_ref)
-            features = self.net_extractor(ll_y, ll_r)
+            use_feature_wavelet = (
+                self.use_feature_wavelet_matching or
+                hasattr(net_wavelet, 'extract_matching_features'))
+            if use_feature_wavelet:
+                if not hasattr(net_wavelet, 'extract_matching_features'):
+                    raise TypeError(
+                        'use_feature_wavelet_matching=True requires '
+                        'network_wavelet to implement extract_matching_features().')
+                features = net_wavelet.extract_matching_features(
+                    self.match_img_in, self.img_ref)
+                wavelet_features = features
+            else:
+                ll_y, ll_r, highfreq_r = self.net_wavelet(
+                    self.match_img_in, self.img_ref)
+                features = self.net_extractor(ll_y, ll_r)
+                needs_upsample = True
             pre_offset_flow_sim, img_ref_feat = self.net_map(
                 features, self.img_ref)
-            needs_upsample = True
             hf_flow_key = 'relu1_1'
         else:
             features = self.net_extractor(self.match_img_in, self.img_ref)
@@ -294,10 +316,15 @@ class RefRestorationModel(SRModel):
 
         F_wav = None
         if self.use_ref_hf_residual:
-            if highfreq_r is None:
-                _, highfreq_r = self.net_wavelet.dwt_forward(self.img_ref)
-            F_wav = self.net_wavelet.warp_highfreq(
-                highfreq_r, pre_flow[hf_flow_key])
+            if (wavelet_features is not None and
+                    hasattr(net_wavelet, 'transfer_ref_hf')):
+                F_wav = net_wavelet.transfer_ref_hf(
+                    wavelet_features, pre_flow)
+            else:
+                if highfreq_r is None:
+                    _, highfreq_r = net_wavelet.dwt_forward(self.img_ref)
+                F_wav = net_wavelet.warp_highfreq(
+                    highfreq_r, pre_flow[hf_flow_key])
 
         if needs_upsample:
             pre_offset, pre_flow, pre_similarity = upsample_offsets(

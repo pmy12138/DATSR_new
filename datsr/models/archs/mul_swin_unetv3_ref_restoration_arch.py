@@ -798,6 +798,7 @@ class NewSwinUnetv3RestorationNet(nn.Module):
                  depths=(8, 8), num_heads=(8, 8), window_size=8,
                  use_checkpoint=False, K=2, wav_channels=64,
                  use_wavelet_ll_matching=False,
+                 use_feature_wavelet_matching=False,
                  legacy_wav_concat=False, use_ref_hf_residual=False,
                  use_similarity_gate=False, zero_init_ref_hf=True,
                  init_ref_hf_scale=1.0, max_ref_hf_scale=None):
@@ -854,6 +855,12 @@ class NewSwinUnetv3RestorationNet(nn.Module):
     def get_hf_stats(self, reset=False):
         return self.dyn_agg_restore.get_hf_stats(reset=reset)
 
+    def reset_hf_debug_maps(self):
+        self.dyn_agg_restore.reset_hf_debug_maps()
+
+    def get_hf_debug_maps(self, reset=False):
+        return self.dyn_agg_restore.get_hf_debug_maps(reset=reset)
+
 
 class DynamicAggregationRestoration(nn.Module):
 
@@ -879,10 +886,13 @@ class DynamicAggregationRestoration(nn.Module):
                  patch_norm=True,
                  use_checkpoint=False,
                  K=2,
+                 legacy_wav_concat=False,
                  wav_channels=64,  # 鈫?鏂板: F_wav 鐨勯€氶亾鏁?                 legacy_wav_concat=False,
                  use_ref_hf_residual=False,
                  use_similarity_gate=False,
                  zero_init_ref_hf=True,
+                 init_ref_hf_scale=1.0,
+                 max_ref_hf_scale=None,
                  ):
         super(DynamicAggregationRestoration, self).__init__()
         self.use_checkpoint = use_checkpoint
@@ -896,7 +906,10 @@ class DynamicAggregationRestoration(nn.Module):
         self.legacy_wav_concat = legacy_wav_concat
         self.use_ref_hf_residual = use_ref_hf_residual or legacy_wav_concat
         self.use_similarity_gate = use_similarity_gate
+        self.max_ref_hf_scale = max_ref_hf_scale
         self.collect_hf_stats = False
+        self.collect_hf_debug_maps = False
+        self._hf_debug_maps = {}
         self._hf_stat_sums = defaultdict(float)
         self._hf_stat_counts = defaultdict(int)
         if not self.legacy_wav_concat and self.use_ref_hf_residual:
@@ -1037,6 +1050,15 @@ class DynamicAggregationRestoration(nn.Module):
             self.reset_hf_stats()
         return stats
 
+    def reset_hf_debug_maps(self):
+        self._hf_debug_maps = {}
+
+    def get_hf_debug_maps(self, reset=False):
+        maps = self._hf_debug_maps
+        if reset:
+            self.reset_hf_debug_maps()
+        return maps
+
     def _get_ref_hf_scale(self):
         if not hasattr(self, 'ref_hf_scale'):
             return None
@@ -1070,6 +1092,15 @@ class DynamicAggregationRestoration(nn.Module):
             for key, value in items.items():
                 self._hf_stat_sums[key] += value
                 self._hf_stat_counts[key] += 1
+
+    def _record_hf_debug_maps(self, prefix, gate, residual):
+        if not self.collect_hf_debug_maps:
+            return
+        with torch.no_grad():
+            self._hf_debug_maps[f'{prefix}_gate'] = gate.detach().cpu()
+            self._hf_debug_maps[
+                f'{prefix}_hf_residual_abs'] = residual.detach().abs().mean(
+                    dim=1, keepdim=True).cpu()
 
 
 
@@ -1217,6 +1248,7 @@ class DynamicAggregationRestoration(nn.Module):
                 gate = gate * sim_gate
             residual = self._get_ref_hf_scale() * wav_feat * gate
             self._record_hf_stats('enc', h, F_wav, wav_feat, gate, residual)
+            self._record_hf_debug_maps('enc', gate, residual)
             h = h + residual
 
         h = self.down_body_medium(h) + x1  # [9, 128, 80, 80]
@@ -1286,6 +1318,7 @@ class DynamicAggregationRestoration(nn.Module):
                 gate = gate * sim_gate
             residual = self._get_ref_hf_scale() * wav_feat * gate
             self._record_hf_stats('dec', h, F_wav, wav_feat, gate, residual)
+            self._record_hf_debug_maps('dec', gate, residual)
             h = h + residual
 
         h = self.up_body_medium(h) + x  # [9, 128, 80, 80]

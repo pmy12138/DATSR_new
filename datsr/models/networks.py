@@ -108,6 +108,15 @@ def define_net_extractor(opt):
     return net_extractor
 
 
+def define_net_wavelet(opt):
+    opt_net = opt.get('network_wavelet', None)
+    if opt_net is None:
+        opt_net = {'type': 'WaveletFrequencyBranch', 'out_channels': 64}
+    opt_net = opt_net.copy()
+    network_type = opt_net.pop('type')
+    return dynamical_instantiation(_arch_modules, network_type, opt_net)
+
+
 def define_net_student(opt):
     opt_net = opt['network_student']
     network_type = opt_net.pop('type')

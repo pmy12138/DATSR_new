@@ -3,9 +3,12 @@
 小波频域分支: DWT 分解 + 高频子带对齐迁移.
 """
 
+from collections import OrderedDict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.models.vgg as vgg
 
 
 class DWTForward(nn.Module):
@@ -115,6 +118,141 @@ class WaveletFrequencyBranch(nn.Module):
         ll_y, _ = self.dwt_forward(img_in_up)
         ll_r, highfreq_r = self.dwt_forward(img_ref)
         return ll_y, ll_r, highfreq_r
+
+
+class WaveletVGGFeatureExtractor(nn.Module):
+    """VGG feature extractor with Haar WavePool for WTRN-style LL matching.
+
+    The LL path replaces VGG max-pooling before conv2/conv3, while the
+    discarded LH/HL/HH feature sub-bands are kept for reference texture
+    transfer.
+    """
+
+    def __init__(self):
+        super(WaveletVGGFeatureExtractor, self).__init__()
+        vgg16_layers = [
+            'conv1_1', 'relu1_1', 'conv1_2', 'relu1_2', 'pool1', 'conv2_1',
+            'relu2_1', 'conv2_2', 'relu2_2', 'pool2', 'conv3_1'
+        ]
+        features = getattr(vgg, 'vgg16')(pretrained=True).features[:11]
+
+        self.slice1 = nn.Sequential(OrderedDict(
+            (name, layer) for name, layer in zip(vgg16_layers[:4], features[:4])
+        ))
+        self.slice2 = nn.Sequential(OrderedDict(
+            (name, layer) for name, layer in zip(vgg16_layers[5:9], features[5:9])
+        ))
+        self.slice3 = nn.Sequential(OrderedDict(
+            [('conv3_1', features[10])]
+        ))
+        self.pool1 = DWTForward()
+        self.pool2 = DWTForward()
+        self.register_buffer(
+            'mean',
+            torch.Tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer(
+            'std',
+            torch.Tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def forward(self, image):
+        x = (image - self.mean) / self.std
+        x = self.slice1(x)
+        ll1, hf1 = self.pool1(x)
+        x = self.slice2(ll1)
+        ll2, hf2 = self.pool2(x)
+        dense = self.slice3(ll2)
+        return dense, {'pool1': hf1, 'pool2': hf2}
+
+
+class WaveletVGGFrequencyBranch(nn.Module):
+    """Feature-domain low-frequency matching and high-frequency transfer.
+
+    This branch follows the WTRN idea more closely than RGB-domain DWT:
+    matching features are extracted from the VGG LL path, and reference
+    LH/HL/HH feature sub-bands are warped with the resulting correspondence.
+    The transferred feature-domain high frequencies are projected to the
+    existing DATSR medium-scale `F_wav` interface.
+    """
+
+    def __init__(self, out_channels=64):
+        super(WaveletVGGFrequencyBranch, self).__init__()
+        self.out_channels = out_channels
+        self.extractor = WaveletVGGFeatureExtractor()
+        self.pool1_proj = nn.Sequential(
+            nn.Conv2d(64 * 3, out_channels, 3, 1, 1),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(out_channels, out_channels, 3, 1, 1),
+        )
+        self.pool2_proj = nn.Sequential(
+            nn.Conv2d(128 * 3, out_channels, 3, 1, 1),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(out_channels, out_channels, 3, 1, 1),
+        )
+        self.hf_fusion = nn.Sequential(
+            nn.Conv2d(out_channels * 2, out_channels, 1, 1, 0),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(out_channels, out_channels, 3, 1, 1),
+        )
+
+    @staticmethod
+    def _flow_warp(x, flow):
+        assert x.size()[-2:] == flow.size()[1:3], (
+            f"Spatial size mismatch: x {x.shape} vs flow {flow.shape}")
+        _, _, h, w = x.size()
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(0, h, dtype=x.dtype, device=x.device),
+            torch.arange(0, w, dtype=x.dtype, device=x.device))
+        grid = torch.stack((grid_x, grid_y), dim=2).float().unsqueeze(0)
+        vgrid = grid + flow
+        vgrid_x = 2.0 * vgrid[:, :, :, 0] / max(w - 1, 1) - 1.0
+        vgrid_y = 2.0 * vgrid[:, :, :, 1] / max(h - 1, 1) - 1.0
+        vgrid_scaled = torch.stack((vgrid_x, vgrid_y), dim=3)
+        return F.grid_sample(
+            x, vgrid_scaled, mode='bilinear',
+            padding_mode='zeros', align_corners=True)
+
+    @staticmethod
+    def _resize_flow_to(flow, size):
+        target_h, target_w = size
+        b, h, w, _ = flow.shape
+        if (h, w) == (target_h, target_w):
+            return flow
+        flow_chw = flow.permute(0, 3, 1, 2)
+        flow_chw = F.interpolate(
+            flow_chw, size=(target_h, target_w),
+            mode='bilinear', align_corners=True)
+        flow_chw[:, 0] *= target_w / max(w, 1)
+        flow_chw[:, 1] *= target_h / max(h, 1)
+        return flow_chw.permute(0, 2, 3, 1)
+
+    def extract_matching_features(self, img_in_up, img_ref):
+        dense_in, _ = self.extractor(img_in_up)
+        dense_ref, ref_hf = self.extractor(img_ref)
+        return {
+            'dense_features1': dense_in,
+            'dense_features2': dense_ref,
+            'ref_hf_pool1': ref_hf['pool1'],
+            'ref_hf_pool2': ref_hf['pool2'],
+        }
+
+    def transfer_ref_hf(self, wavelet_features, pre_flow):
+        hf_pool1 = wavelet_features['ref_hf_pool1']
+        hf_pool2 = wavelet_features['ref_hf_pool2']
+
+        flow_pool1 = self._resize_flow_to(
+            pre_flow['relu2_1'], hf_pool1.shape[-2:])
+        flow_pool2 = self._resize_flow_to(
+            pre_flow['relu3_1'], hf_pool2.shape[-2:])
+
+        hf_pool1 = self._flow_warp(hf_pool1, flow_pool1)
+        hf_pool2 = self._flow_warp(hf_pool2, flow_pool2)
+
+        feat1 = self.pool1_proj(hf_pool1)
+        feat2 = self.pool2_proj(hf_pool2)
+        feat2 = F.interpolate(
+            feat2, size=feat1.shape[-2:], mode='bilinear',
+            align_corners=False)
+        return self.hf_fusion(torch.cat([feat1, feat2], dim=1))
 
 
 def upsample_offsets(pre_offset, pre_flow, pre_similarity, scale=2):
