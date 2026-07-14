@@ -87,6 +87,150 @@ def feature_match_index(feat_input,
     return max_idx, max_val
 
 
+def geometry_guided_feature_match_index(
+        feat_input,
+        feat_ref,
+        projected_ref_coords,
+        geometry_valid_mask,
+        patch_size=3,
+        input_stride=1,
+        ref_stride=1,
+        is_norm=True,
+        norm_input=False,
+        search_radius=4,
+        position_weight=0.0,
+        position_sigma=2.0):
+    """Match Q patches only near their camera/depth-predicted Ref position.
+
+    ``projected_ref_coords`` contains normalized x/y coordinates in the Ref
+    image. For geometrically valid query locations, Ref candidates outside a
+    square window are assigned a matching logit of negative infinity. Invalid
+    projections deliberately fall back to global appearance matching.
+    """
+    if projected_ref_coords is None or geometry_valid_mask is None:
+        raise ValueError(
+            'Projective-window matching requires Ref coordinates and a valid mask.')
+    if search_radius < 0:
+        raise ValueError('search_radius must be non-negative.')
+    if position_weight < 0:
+        raise ValueError('position_weight must be non-negative.')
+    if position_sigma <= 0:
+        raise ValueError('position_sigma must be positive.')
+
+    _, input_h, input_w = feat_input.shape
+    _, ref_h, ref_w = feat_ref.shape
+    query_h = int((input_h - patch_size) / input_stride + 1)
+    query_w = int((input_w - patch_size) / input_stride + 1)
+    ref_grid_h = int((ref_h - patch_size) / ref_stride + 1)
+    ref_grid_w = int((ref_w - patch_size) / ref_stride + 1)
+
+    coords = projected_ref_coords
+    if coords.dim() == 3:
+        coords = coords.unsqueeze(0)
+    mask = geometry_valid_mask
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0).unsqueeze(0)
+    elif mask.dim() == 3:
+        mask = mask.unsqueeze(0)
+    if coords.shape[1] != 2 or mask.shape[1] != 1:
+        raise ValueError(
+            'Projected Ref coordinates/mask must have 2 and 1 channels.')
+    coords = F.interpolate(coords.float(), size=(query_h, query_w),
+                           mode='nearest').squeeze(0)
+    mask = F.interpolate(mask.float(), size=(query_h, query_w),
+                         mode='nearest').squeeze(0).squeeze(0) > 0.5
+
+    # Convert normalized Ref image coordinates to indices of Ref patch
+    # centres. Clamping ensures that every valid projection has candidates.
+    patch_center = (patch_size - 1) * 0.5
+    pred_x_feat = coords[0] * max(ref_w - 1, 1)
+    pred_y_feat = coords[1] * max(ref_h - 1, 1)
+    pred_x = ((pred_x_feat - patch_center) / ref_stride).clamp(
+        0, max(ref_grid_w - 1, 0))
+    pred_y = ((pred_y_feat - patch_center) / ref_stride).clamp(
+        0, max(ref_grid_h - 1, 0))
+    # Unfold Q/K once. Unlike global convolution, the valid path below gathers
+    # only (2r+1)^2 Ref patches for each query, so geometry reduces the actual
+    # QK computation rather than merely masking an already-global score map.
+    query_patches = F.unfold(
+        feat_input.unsqueeze(0), kernel_size=patch_size,
+        stride=input_stride).squeeze(0)
+    ref_patches = F.unfold(
+        feat_ref.unsqueeze(0), kernel_size=patch_size,
+        stride=ref_stride).squeeze(0)
+    if norm_input:
+        query_patches = F.normalize(query_patches, p=2, dim=0, eps=1e-5)
+    if is_norm:
+        ref_patches = F.normalize(ref_patches, p=2, dim=0, eps=1e-5)
+
+    n_queries = query_patches.shape[1]
+    n_ref_patches = ref_patches.shape[1]
+    descriptor_dim = query_patches.shape[0]
+    pred_x = pred_x.reshape(-1)
+    pred_y = pred_y.reshape(-1)
+    mask = mask.reshape(-1)
+    max_idx = torch.empty(n_queries, dtype=torch.long, device=feat_input.device)
+    max_val = torch.empty(n_queries, dtype=feat_input.dtype,
+                          device=feat_input.device)
+
+    offsets_y, offsets_x = torch.meshgrid(
+        torch.arange(-search_radius, search_radius + 1,
+                     device=feat_input.device),
+        torch.arange(-search_radius, search_radius + 1,
+                     device=feat_input.device))
+    offsets_x = offsets_x.reshape(-1)
+    offsets_y = offsets_y.reshape(-1)
+    candidate_count = offsets_x.numel()
+
+    valid_queries = torch.nonzero(mask, as_tuple=False).squeeze(1)
+    # Bound the temporary selected-patch tensor to roughly 64 MiB for fp32.
+    local_chunk = max(1, int(16 * 1024**2 /
+                             max(descriptor_dim * candidate_count, 1)))
+    for start in range(0, valid_queries.numel(), local_chunk):
+        query_indices = valid_queries[start:start + local_chunk]
+        centre_x = pred_x[query_indices].round().long()
+        centre_y = pred_y[query_indices].round().long()
+        candidate_x = centre_x[:, None] + offsets_x[None]
+        candidate_y = centre_y[:, None] + offsets_y[None]
+        in_bounds = ((candidate_x >= 0) & (candidate_x < ref_grid_w)
+                     & (candidate_y >= 0) & (candidate_y < ref_grid_h))
+        candidate_x_safe = candidate_x.clamp(0, ref_grid_w - 1)
+        candidate_y_safe = candidate_y.clamp(0, ref_grid_h - 1)
+        candidate_indices = (candidate_y_safe * ref_grid_w
+                             + candidate_x_safe)
+        selected_ref = ref_patches[:, candidate_indices.reshape(-1)].view(
+            descriptor_dim, query_indices.numel(), candidate_count)
+        appearance = (query_patches[:, query_indices, None]
+                      * selected_ref).sum(dim=0)
+        logits = appearance.masked_fill(
+            ~in_bounds, torch.finfo(appearance.dtype).min)
+        if position_weight > 0:
+            delta_x = candidate_x.float() - pred_x[query_indices, None]
+            delta_y = candidate_y.float() - pred_y[query_indices, None]
+            logits = logits - position_weight * (
+                delta_x.square() + delta_y.square()) / (
+                    2.0 * position_sigma * position_sigma)
+        _, local_choice = logits.max(dim=1)
+        max_idx[query_indices] = candidate_indices.gather(
+            1, local_choice[:, None]).squeeze(1)
+        max_val[query_indices] = appearance.gather(
+            1, local_choice[:, None]).squeeze(1)
+
+    # Depth holes, points behind the Ref camera, and projections outside the
+    # Ref field of view have no reliable geometric centre. Only those queries
+    # fall back to the original global appearance match.
+    invalid_queries = torch.nonzero(~mask, as_tuple=False).squeeze(1)
+    global_chunk = max(1, int(16 * 1024**2 / max(n_ref_patches, 1)))
+    for start in range(0, invalid_queries.numel(), global_chunk):
+        query_indices = invalid_queries[start:start + global_chunk]
+        appearance = query_patches[:, query_indices].transpose(0, 1) @ ref_patches
+        values, indices = appearance.max(dim=1)
+        max_idx[query_indices] = indices
+        max_val[query_indices] = values
+
+    return max_idx.view(query_h, query_w), max_val.view(query_h, query_w)
+
+
 def topk_feature_match_index(feat_input,
                              feat_ref,
                              patch_size=3,

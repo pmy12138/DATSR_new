@@ -1,0 +1,77 @@
+name: test_datsr_mc_refsr_geometry_guided_matching
+suffix: ~
+scale: 4
+model_type: RefRestorationModel
+set_CUDA_VISIBLE_DEVICES: ~
+crop_border: 4
+gpu_ids: [0]
+
+datasets:
+  test:
+    name: MCRefSR_geometry_guided_matching_test
+    type: MCRefSRDataset
+    dataroot_in: datasets/test/input
+    dataroot_gt: datasets/test/gt
+    dataroot_ref: datasets/test/ref
+    dataroot_depth_metric: datasets/test/depth_metric
+    camera_manifest: datasets/mc_camera_manifest.json
+    use_albedo: false
+    ref_mode: normal
+    use_geometry_ref_crop: false
+    use_matching_geo_prior: true
+    matching_geo_mode: projective_window
+    geometry_depth_type: ray_distance
+    geometry_use_ref_depth_consistency: false
+    geometry_depth_consistency_rel_tol: 0.05
+    geometry_depth_consistency_abs_tol: 0.10
+    geometry_strict_pairs: true
+    io_backend:
+      type: disk
+    window_size: 8
+
+val_func: BasicSRValidation
+save_img: true
+calculate_lpips: true
+lpips_net: alex
+
+network_g:
+  type: NewSwinUnetv3RestorationNet
+  ngf: 128
+  n_blocks: 8
+  groups: 8
+  embed_dim: 128
+  depths: [4, 4]
+  num_heads: [4, 4]
+  window_size: 8
+  use_checkpoint: true
+  K: 1
+  use_aux_albedo: false
+  use_wavelet_ll_matching: false
+  use_feature_wavelet_matching: false
+  use_ref_hf_residual: false
+  use_similarity_gate: false
+  legacy_wav_concat: false
+
+network_map:
+  type: FlowSimCorrespondenceGenerationArch
+  patch_size: 3
+  stride: 1
+  vgg_layer_list: ['relu1_1', 'relu2_1', 'relu3_1']
+  vgg_type: vgg19
+  use_matching_geo_prior: true
+  matching_geo_mode: projective_window
+  geometry_search_radius: 4
+  geometry_position_weight: 0.05
+  geometry_position_sigma: 2.0
+  normalize_similarity: false
+
+network_extractor:
+  type: ContrasExtractorSep
+
+path:
+  pretrain_model_g: experiments/train/train_datsr_mc_refsr_geometry_guided_matching/models/net_g_40000.pth
+  pretrain_model_d: ~
+  pretrain_model_feature_extractor: experiments/pretrained_model/feature_extraction.pth
+  pretrain_model_wavelet: ~
+  strict_load: true
+  root: experiments/test/

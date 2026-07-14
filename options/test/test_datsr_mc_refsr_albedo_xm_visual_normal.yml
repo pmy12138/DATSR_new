@@ -1,0 +1,69 @@
+name: test_datsr_mc_refsr_albedo_xm_visual_normal
+suffix: ~
+scale: 4
+model_type: RefRestorationModel
+set_CUDA_VISIBLE_DEVICES: ~
+crop_border: 4
+gpu_ids: [0]
+
+datasets:
+  test:
+    name: MCRefSR_albedo_xm_visual_normal
+    type: MCRefSRDataset
+    dataroot_in: datasets/test/input
+    dataroot_gt: datasets/test/gt
+    dataroot_ref: datasets/test/ref
+    dataroot_albedo: datasets/test/albedo
+    use_albedo: true
+    albedo_mode: normal
+    test_filenames:
+      - staircase_scene_0004.png
+      - staircase_scene_0006.png
+      - staircase_scene_0050.png
+      - staircase_scene_0062.png
+    io_backend:
+      type: disk
+    window_size: 8
+
+val_func: BasicSRValidation
+save_img: true
+calculate_lpips: false
+
+network_g:
+  type: NewSwinUnetv3RestorationNet
+  ngf: 128
+  n_blocks: 8
+  groups: 8
+  embed_dim: 128
+  depths: [4, 4]
+  num_heads: [4, 4]
+  window_size: 8
+  use_checkpoint: true
+  K: 1
+  use_aux_albedo: true
+  aux_in_channels: 3
+  aux_init_scale: !!float 1e-2
+  aux_num_heads: 4
+  use_wavelet_ll_matching: false
+  use_feature_wavelet_matching: false
+  use_ref_hf_residual: false
+  use_similarity_gate: false
+  legacy_wav_concat: false
+
+network_map:
+  type: FlowSimCorrespondenceGenerationArch
+  patch_size: 3
+  stride: 1
+  vgg_layer_list: ['relu1_1', 'relu2_1', 'relu3_1']
+  vgg_type: 'vgg19'
+
+network_extractor:
+  type: ContrasExtractorSep
+
+path:
+  pretrain_model_g: experiments/train/train_datsr_mc_refsr_albedo_xm_scene_split/models/net_g_10000.pth
+  pretrain_model_d: ~
+  pretrain_model_feature_extractor: experiments/pretrained_model/feature_extraction.pth
+  pretrain_model_wavelet: ~
+  strict_load: false
+  root: experiments/test/

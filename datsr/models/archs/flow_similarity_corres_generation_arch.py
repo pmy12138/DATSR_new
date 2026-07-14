@@ -5,7 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from datsr.models.archs.arch_util import tensor_shift
-from datsr.models.archs.ref_map_util import feature_match_index
+from datsr.models.archs.ref_map_util import (feature_match_index,
+                                              geometry_guided_feature_match_index)
 from datsr.models.archs.vgg_arch import VGGFeatureExtractor
 
 logger = logging.getLogger('base')
@@ -18,15 +19,64 @@ class FlowSimCorrespondenceGenerationArch(nn.Module):
                  stride=1,
                  vgg_layer_list=['relu3_1', 'relu2_1', 'relu1_1'],
                  vgg_type='vgg19',
-                 use_freq_matching=False):
+                 use_freq_matching=False,
+                 use_matching_geo_prior=False,
+                 matching_geo_mode='depth',
+                 normalize_similarity=False,
+                 geometry_prior_strength=1.0,
+                 geometry_prior_floor=0.25,
+                 geometry_prior_grad_scale=4.0,
+                 geometry_prior_blur_kernel=5,
+                 geometry_search_radius=4,
+                 geometry_position_weight=0.0,
+                 geometry_position_sigma=2.0):
         super(FlowSimCorrespondenceGenerationArch, self).__init__()
         self.patch_size = patch_size
         self.stride = stride
         self.use_freq_matching = use_freq_matching
+        self.use_matching_geo_prior = use_matching_geo_prior
+        self.matching_geo_mode = matching_geo_mode
+        self.normalize_similarity = normalize_similarity
+        self.geometry_prior_strength = float(geometry_prior_strength)
+        self.geometry_prior_floor = float(geometry_prior_floor)
+        self.geometry_prior_grad_scale = float(geometry_prior_grad_scale)
+        self.geometry_prior_blur_kernel = int(geometry_prior_blur_kernel)
+        self.geometry_search_radius = int(geometry_search_radius)
+        self.geometry_position_weight = float(geometry_position_weight)
+        self.geometry_position_sigma = float(geometry_position_sigma)
+
+        if (self.use_matching_geo_prior
+                and self.matching_geo_mode not in ['depth', 'projective_window']):
+            raise ValueError(
+                'matching_geo_mode must be depth or projective_window.')
+        if not 0.0 <= self.geometry_prior_strength <= 1.0:
+            raise ValueError('geometry_prior_strength must be in [0, 1].')
+        if not 0.0 <= self.geometry_prior_floor <= 1.0:
+            raise ValueError('geometry_prior_floor must be in [0, 1].')
+        if self.geometry_prior_blur_kernel < 1 or (
+                self.geometry_prior_blur_kernel % 2 == 0):
+            raise ValueError(
+                'geometry_prior_blur_kernel must be a positive odd integer.')
+        if self.geometry_search_radius < 0:
+            raise ValueError('geometry_search_radius must be non-negative.')
+        if self.geometry_position_weight < 0:
+            raise ValueError('geometry_position_weight must be non-negative.')
+        if self.geometry_position_sigma <= 0:
+            raise ValueError('geometry_position_sigma must be positive.')
 
         self.vgg_layer_list = vgg_layer_list
         self.vgg = VGGFeatureExtractor(
             layer_name_list=vgg_layer_list, vgg_type=vgg_type)
+        self.register_buffer(
+            'sobel_x',
+            torch.tensor([[-1., 0., 1.],
+                          [-2., 0., 2.],
+                          [-1., 0., 1.]], dtype=torch.float32).view(1, 1, 3, 3))
+        self.register_buffer(
+            'sobel_y',
+            torch.tensor([[-1., -2., -1.],
+                          [0., 0., 0.],
+                          [1., 2., 1.]], dtype=torch.float32).view(1, 1, 3, 3))
 
     def index_to_flow(self, max_idx):
         device = max_idx.device
@@ -64,7 +114,61 @@ class FlowSimCorrespondenceGenerationArch(nn.Module):
         corr = corr.squeeze(0)
         return corr
 
-    def forward(self, dense_features, img_ref_hr):
+    @staticmethod
+    def _normalize_tensor_map(x):
+        flat = x.reshape(x.size(0), -1)
+        x_min = flat.min(dim=1)[0].reshape(-1, 1, 1, 1)
+        x_max = flat.max(dim=1)[0].reshape(-1, 1, 1, 1)
+        return (x - x_min) / (x_max - x_min + 1e-6)
+
+    def _build_matching_geo_prior(self, depth_guidance, target_size):
+        if depth_guidance is None:
+            return None
+        if depth_guidance.dim() == 3:
+            depth_guidance = depth_guidance.unsqueeze(1)
+        if depth_guidance.shape[1] != 1:
+            raise ValueError(
+                'Depth guidance for matching must have exactly one channel.')
+        if depth_guidance.shape[-2:] != target_size:
+            depth_guidance = F.interpolate(
+                depth_guidance,
+                size=target_size,
+                mode='bilinear',
+                align_corners=False)
+        depth_guidance = self._normalize_tensor_map(depth_guidance.float())
+        grad_x = F.conv2d(depth_guidance, self.sobel_x, padding=1)
+        grad_y = F.conv2d(depth_guidance, self.sobel_y, padding=1)
+        grad_mag = torch.sqrt(grad_x * grad_x + grad_y * grad_y + 1e-12)
+        grad_mag = grad_mag / (
+            grad_mag.mean(dim=(2, 3), keepdim=True) + 1e-6)
+        confidence = torch.exp(-self.geometry_prior_grad_scale * grad_mag)
+        if self.geometry_prior_blur_kernel > 1:
+            padding = self.geometry_prior_blur_kernel // 2
+            confidence = F.avg_pool2d(
+                confidence,
+                kernel_size=self.geometry_prior_blur_kernel,
+                stride=1,
+                padding=padding)
+        return confidence.clamp_(0.0, 1.0)
+
+    def _apply_similarity_guidance(self, sim_map, depth_guidance):
+        sim_out = torch.sigmoid(sim_map) if self.normalize_similarity else sim_map
+        if (not self.use_matching_geo_prior
+                or self.matching_geo_mode == 'projective_window'):
+            return sim_out
+        if depth_guidance is None:
+            raise ValueError(
+                'use_matching_geo_prior=True requires depth guidance input.')
+        geo_prior = self._build_matching_geo_prior(
+            depth_guidance, sim_out.shape[-2:])
+        geo_weight = self.geometry_prior_floor + (
+            1.0 - self.geometry_prior_floor) * geo_prior
+        guided = sim_out * geo_weight
+        return ((1.0 - self.geometry_prior_strength) * sim_out +
+                self.geometry_prior_strength * guided)
+
+    def forward(self, dense_features, img_ref_hr, depth_guidance=None,
+                projected_ref_coords=None, geometry_valid_mask=None):
         batch_offset_relu3 = []
         batch_offset_relu2 = []
         batch_offset_relu1 = []
@@ -83,14 +187,33 @@ class FlowSimCorrespondenceGenerationArch(nn.Module):
             feat_ref = F.normalize(
                 feat_ref.reshape(c, -1), dim=0).view(c, h, w)
 
-            _max_idx, _max_val = feature_match_index(
-                feat_in,
-                feat_ref,
-                patch_size=self.patch_size,
-                input_stride=self.stride,
-                ref_stride=self.stride,
-                is_norm=True,
-                norm_input=True)
+            if (self.use_matching_geo_prior
+                    and self.matching_geo_mode == 'projective_window'):
+                if projected_ref_coords is None or geometry_valid_mask is None:
+                    raise ValueError(
+                        'projective_window matching requires geometry tensors.')
+                _max_idx, _max_val = geometry_guided_feature_match_index(
+                    feat_in,
+                    feat_ref,
+                    projected_ref_coords[ind],
+                    geometry_valid_mask[ind],
+                    patch_size=self.patch_size,
+                    input_stride=self.stride,
+                    ref_stride=self.stride,
+                    is_norm=True,
+                    norm_input=True,
+                    search_radius=self.geometry_search_radius,
+                    position_weight=self.geometry_position_weight,
+                    position_sigma=self.geometry_position_sigma)
+            else:
+                _max_idx, _max_val = feature_match_index(
+                    feat_in,
+                    feat_ref,
+                    patch_size=self.patch_size,
+                    input_stride=self.stride,
+                    ref_stride=self.stride,
+                    is_norm=True,
+                    norm_input=True)
 
             sim_relu3 = F.pad(_max_val, (1, 1, 1, 1)).unsqueeze(0).unsqueeze(0)
 
@@ -101,6 +224,13 @@ class FlowSimCorrespondenceGenerationArch(nn.Module):
                                           size=sim_relu3.shape[-2:],
                                           mode='bilinear', align_corners=False)
                 sim_relu3 = sim_relu3 * freq_corr
+
+            depth_slice = None
+            if (self.matching_geo_mode == 'depth'
+                    and depth_guidance is not None):
+                depth_slice = depth_guidance[ind:ind + 1]
+            sim_relu3 = self._apply_similarity_guidance(
+                sim_relu3, depth_slice)
 
             similarity_relu3.append(sim_relu3)
 

@@ -164,6 +164,15 @@ class RefRestorationModel(SRModel):
             logger.info('Remove style loss.')
             self.cri_style = None
 
+        if train_opt.get('edge_opt', None):
+            edge_opt = train_opt['edge_opt'].copy()
+            cri_edge_type = edge_opt.pop('type', 'EdgeLoss')
+            cri_edge_cls = getattr(loss_module, cri_edge_type)
+            self.cri_edge = cri_edge_cls(**edge_opt).to(self.device)
+        else:
+            logger.info('Remove edge loss.')
+            self.cri_edge = None
+
         if train_opt.get('texture_opt', None):
             cri_texture_cls = getattr(loss_module, 'TextureLoss')
             self.cri_texture = cri_texture_cls(**train_opt['texture_opt']).to(
@@ -217,6 +226,12 @@ class RefRestorationModel(SRModel):
         self.img_ref = data['img_ref'].to(self.device)
         self.gt = data['img_in'].to(self.device)  # gt  
         self.match_img_in = data['img_in_up'].to(self.device)
+        self.img_albedo = data['img_albedo'].to(self.device) if 'img_albedo' in data else None
+        self.img_depth = data['img_depth'].to(self.device) if 'img_depth' in data else None
+        self.geo_ref_coords = (data['geo_ref_coords'].to(self.device)
+                               if 'geo_ref_coords' in data else None)
+        self.geo_valid_mask = (data['geo_valid_mask'].to(self.device)
+                               if 'geo_valid_mask' in data else None)
         if 'img_in_ori' in data:
             self.gt_ori = data['img_in_ori'].to(self.device)
 
@@ -247,7 +262,8 @@ class RefRestorationModel(SRModel):
         # Step 3: 对应关系生成  
         # 匹配在 LL 特征上进行, VGG ref features 从原始 img_ref (160x160) 提取 (选择 A)  
         pre_offset_flow_sim, img_ref_feat = self.net_map(
-            features, self.img_ref)
+            features, self.img_ref, self.img_depth,
+            self.geo_ref_coords, self.geo_valid_mask)
         # pre_flow['relu3_1']: (B, 20, 20, 2)  
         # pre_flow['relu2_1']: (B, 40, 40, 2)  
         # pre_flow['relu1_1']: (B, 80, 80, 2)  
@@ -302,12 +318,14 @@ class RefRestorationModel(SRModel):
                 features = self.net_extractor(ll_y, ll_r)
                 needs_upsample = True
             pre_offset_flow_sim, img_ref_feat = self.net_map(
-                features, self.img_ref)
+                features, self.img_ref, self.img_depth,
+                self.geo_ref_coords, self.geo_valid_mask)
             hf_flow_key = 'relu1_1'
         else:
             features = self.net_extractor(self.match_img_in, self.img_ref)
             pre_offset_flow_sim, img_ref_feat = self.net_map(
-                features, self.img_ref)
+                features, self.img_ref, self.img_depth,
+                self.geo_ref_coords, self.geo_valid_mask)
             hf_flow_key = 'relu2_1'
 
         pre_offset = pre_offset_flow_sim[0]
@@ -339,7 +357,7 @@ class RefRestorationModel(SRModel):
 
         # 空域分支: DATSR 主网络  
         self.output = self.net_g(self.img_in_lq, pre_offset_flow_sim,
-                                 img_ref_feat, F_wav)
+                                 img_ref_feat, F_wav, self.img_albedo)
 
         if step <= self.net_g_pretrain_steps:
             # pretrain the net_g with pixel Loss  
@@ -395,6 +413,10 @@ class RefRestorationModel(SRModel):
                     _, l_g_style = self.cri_style(self.output, self.gt)
                     l_g_total += l_g_style
                     self.log_dict['l_g_style'] = l_g_style.item()
+                if self.cri_edge:
+                    l_g_edge = self.cri_edge(self.output, self.gt)
+                    l_g_total += l_g_edge
+                    self.log_dict['l_g_edge'] = l_g_edge.item()
                 if self.cri_texture:
                     l_g_texture = self.cri_texture(self.output, self.maps,
                                                    self.weights)
@@ -421,7 +443,7 @@ class RefRestorationModel(SRModel):
         with torch.no_grad():
             pre_offset_flow_sim, img_ref_feat, F_wav = self._wavelet_forward()
             self.output = self.net_g(self.img_in_lq, pre_offset_flow_sim,
-                                     img_ref_feat, F_wav)
+                                     img_ref_feat, F_wav, self.img_albedo)
         self.net_g.train()
 
     def get_current_visuals(self):
@@ -440,12 +462,46 @@ class RefRestorationModel(SRModel):
             self.save_network(self.net_d, 'net_d', current_iter)
         self.save_training_state(epoch, current_iter)
 
+    def _get_lpips_metric(self):
+        if hasattr(self, 'lpips_metric'):
+            return self.lpips_metric
+
+        try:
+            import lpips
+        except ImportError as exc:
+            raise ImportError(
+                'LPIPS metric requires the optional package "lpips". '
+                'Install it with "pip install lpips", or set '
+                '"calculate_lpips: false" in the val/test config.') from exc
+
+        val_opt = self.opt.get('val', {})
+        lpips_net = val_opt.get('lpips_net', self.opt.get('lpips_net', 'alex'))
+        self.lpips_metric = lpips.LPIPS(net=lpips_net).to(self.device)
+        self.lpips_metric.eval()
+        return self.lpips_metric
+
+    def _calculate_lpips(self, sr_img, gt_img):
+        lpips_metric = self._get_lpips_metric()
+        sr_tensor = img2tensor(sr_img.astype('float32') / 255.,
+                               bgr2rgb=True,
+                               float32=True).unsqueeze(0).to(self.device)
+        gt_tensor = img2tensor(gt_img.astype('float32') / 255.,
+                               bgr2rgb=True,
+                               float32=True).unsqueeze(0).to(self.device)
+        sr_tensor = sr_tensor * 2. - 1.
+        gt_tensor = gt_tensor * 2. - 1.
+        with torch.no_grad():
+            return lpips_metric(sr_tensor, gt_tensor).mean().item()
+
     def nondist_validation(self, dataloader, current_iter, tb_logger,
                            save_img):
         net_g_module = self.net_g.module if hasattr(self.net_g, 'module') else self.net_g
         collect_hf_stats = self.opt.get('val', {}).get(
             'collect_hf_stats', False) or self.opt.get(
             'collect_hf_stats', False)
+        calculate_lpips = self.opt.get('val', {}).get(
+            'calculate_lpips', False) or self.opt.get(
+            'calculate_lpips', False)
         if collect_hf_stats and hasattr(net_g_module, 'reset_hf_stats'):
             net_g_module.reset_hf_stats()
 
@@ -453,6 +509,7 @@ class RefRestorationModel(SRModel):
         avg_psnr = 0.
         avg_psnr_y = 0.
         avg_ssim_y = 0.
+        avg_rel_mse = 0.
         avg_lpips = 0.
         dataset_name = dataloader.dataset.opt['name']
         for idx, val_data in enumerate(dataloader):
@@ -500,35 +557,64 @@ class RefRestorationModel(SRModel):
             sr_img = sr_img[:min_h, :min_w, :]
             gt_img = gt_img[:min_h, :min_w, :]
             # --- end ---
+            crop_border = self.opt.get('crop_border') or 0
             psnr = metrics.psnr(
-                sr_img, gt_img, crop_border=self.opt['crop_border'])
+                sr_img, gt_img, crop_border=crop_border)
             psnr_list.append(psnr)
             avg_psnr += psnr
+            rel_mse = metrics.rel_mse(
+                sr_img, gt_img, crop_border=crop_border)
+            avg_rel_mse += rel_mse
             sr_img_y = metrics.bgr2ycbcr(sr_img / 255., only_y=True)
             gt_img_y = metrics.bgr2ycbcr(gt_img / 255., only_y=True)
             psnr_y = metrics.psnr(
                 sr_img_y * 255,
                 gt_img_y * 255,
-                crop_border=self.opt['crop_border'])
+                crop_border=crop_border)
             avg_psnr_y += psnr_y
             ssim_y = metrics.ssim(
                 sr_img_y * 255,
                 gt_img_y * 255,
-                crop_border=self.opt['crop_border'])
+                crop_border=crop_border)
             avg_ssim_y += ssim_y
 
+            lpips_value = None
+            if calculate_lpips:
+                if crop_border != 0:
+                    sr_lpips_img = sr_img[crop_border:-crop_border,
+                                          crop_border:-crop_border, :]
+                    gt_lpips_img = gt_img[crop_border:-crop_border,
+                                          crop_border:-crop_border, :]
+                else:
+                    sr_lpips_img = sr_img
+                    gt_lpips_img = gt_img
+                lpips_value = self._calculate_lpips(
+                    sr_lpips_img, gt_lpips_img)
+                avg_lpips += lpips_value
+
             if not self.is_train:
-                logger.info(f'# img {img_name} # PSNR: {psnr:.4e} '
-                            f'# PSNR_Y: {psnr_y:.4e} # SSIM_Y: {ssim_y:.4e}.')
+                msg = (f'# img {img_name} # PSNR: {psnr:.4e} '
+                       f'# PSNR_Y: {psnr_y:.4e} # SSIM_Y: {ssim_y:.4e} '
+                       f'# RelMSE: {rel_mse:.4e}')
+                if calculate_lpips:
+                    msg += f' # LPIPS: {lpips_value:.4e}'
+                logger.info(msg + '.')
 
             pbar.update(f'Test {img_name}')
 
         avg_psnr = avg_psnr / (idx + 1)
         avg_psnr_y = avg_psnr_y / (idx + 1)
         avg_ssim_y = avg_ssim_y / (idx + 1)
+        avg_rel_mse = avg_rel_mse / (idx + 1)
+        if calculate_lpips:
+            avg_lpips = avg_lpips / (idx + 1)
 
-        logger.info(f'# Validation {dataset_name} # PSNR: {avg_psnr:.4e} '
-                    f'# PSNR_Y: {avg_psnr_y:.4e} # SSIM_Y: {avg_ssim_y:.4e}.')
+        msg = (f'# Validation {dataset_name} # PSNR: {avg_psnr:.4e} '
+               f'# PSNR_Y: {avg_psnr_y:.4e} # SSIM_Y: {avg_ssim_y:.4e} '
+               f'# RelMSE: {avg_rel_mse:.4e}')
+        if calculate_lpips:
+            msg += f' # LPIPS: {avg_lpips:.4e}'
+        logger.info(msg + '.')
 
         if collect_hf_stats and hasattr(net_g_module, 'get_hf_stats'):
             hf_stats = net_g_module.get_hf_stats(reset=True)
@@ -544,3 +630,6 @@ class RefRestorationModel(SRModel):
             tb_logger.add_scalar('psnr', avg_psnr, current_iter)
             tb_logger.add_scalar('psnr_y', avg_psnr_y, current_iter)
             tb_logger.add_scalar('ssim_y', avg_ssim_y, current_iter)
+            tb_logger.add_scalar('rel_mse', avg_rel_mse, current_iter)
+            if calculate_lpips:
+                tb_logger.add_scalar('lpips', avg_lpips, current_iter)

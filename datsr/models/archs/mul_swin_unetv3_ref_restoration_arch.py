@@ -50,6 +50,142 @@ class ChannelAttention(nn.Module):
         out = avg_out + max_out
         return self.sigmoid(out)
 
+
+class AuxResidualBlock(nn.Module):
+    """Lightweight residual block for same-view auxiliary buffers."""
+
+    def __init__(self, channels):
+        super(AuxResidualBlock, self).__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, 1, 1),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(channels, channels, 3, 1, 1))
+
+    def forward(self, x):
+        return x + self.body(x)
+
+
+class AuxiliaryEncoder(nn.Module):
+    """Encode same-view HR albedo into DATSR multi-scale feature maps."""
+
+    def __init__(self, in_channels=3, feat_channels=64):
+        super(AuxiliaryEncoder, self).__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, feat_channels, 3, 1, 1),
+            nn.LeakyReLU(0.1, True),
+            AuxResidualBlock(feat_channels))
+        self.down_80 = nn.Sequential(
+            nn.Conv2d(feat_channels, feat_channels, 3, 2, 1),
+            nn.LeakyReLU(0.1, True),
+            AuxResidualBlock(feat_channels))
+        self.down_40 = nn.Sequential(
+            nn.Conv2d(feat_channels, feat_channels, 3, 2, 1),
+            nn.LeakyReLU(0.1, True),
+            AuxResidualBlock(feat_channels))
+
+        sobel_x = torch.tensor(
+            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+            dtype=torch.float32).view(1, 1, 3, 3) / 8.0
+        sobel_y = torch.tensor(
+            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+            dtype=torch.float32).view(1, 1, 3, 3) / 8.0
+        self.register_buffer('sobel_x', sobel_x)
+        self.register_buffer('sobel_y', sobel_y)
+
+    @staticmethod
+    def _rgb_to_y(x):
+        if x.size(1) == 1:
+            return x
+        weight = x.new_tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)
+        return (x[:, :3, :, :] * weight).sum(dim=1, keepdim=True)
+
+    def _edge_pyramid(self, x):
+        y = self._rgb_to_y(x)
+        grad_x = F.conv2d(y, self.sobel_x, padding=1)
+        grad_y = F.conv2d(y, self.sobel_y, padding=1)
+        edge_160 = torch.sqrt(grad_x * grad_x + grad_y * grad_y + 1e-12)
+        edge_80 = F.interpolate(
+            edge_160, scale_factor=0.5, mode='bilinear',
+            align_corners=False)
+        edge_40 = F.interpolate(
+            edge_160, scale_factor=0.25, mode='bilinear',
+            align_corners=False)
+        return {'160': edge_160, '80': edge_80, '40': edge_40}
+
+    def forward(self, x):
+        feat_160 = self.stem(x)
+        feat_80 = self.down_80(feat_160)
+        feat_40 = self.down_40(feat_80)
+        return {
+            'feat': {'160': feat_160, '80': feat_80, '40': feat_40},
+            'edge': self._edge_pyramid(x)
+        }
+
+
+class AuxCrossModalityFusion(nn.Module):
+    """AFGSR-style window self/cross attention for auxiliary fusion."""
+
+    def __init__(self, channels, window_size=8, num_heads=4,
+                 init_scale=0.01):
+        super(AuxCrossModalityFusion, self).__init__()
+        self.channels = channels
+        self.window_size = window_size
+        self.norm_self = nn.LayerNorm(channels)
+        self.self_attn = nn.MultiheadAttention(
+            channels, num_heads, batch_first=True)
+        self.norm_q = nn.LayerNorm(channels)
+        self.norm_kv = nn.LayerNorm(channels)
+        self.cross_attn = nn.MultiheadAttention(
+            channels, num_heads, batch_first=True)
+        self.proj = nn.Conv2d(channels, channels, 3, 1, 1)
+        self.gate = nn.Sequential(
+            nn.Conv2d(channels * 2 + 1, channels, 3, 1, 1),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(channels, 1, 3, 1, 1),
+            nn.Sigmoid())
+        self.gamma = nn.Parameter(torch.tensor(float(init_scale)))
+
+    def _windows_to_tokens(self, x):
+        b, c, h, w = x.shape
+        windows = window_partition(x.permute(0, 2, 3, 1).contiguous(),
+                                   self.window_size)
+        return windows.view(-1, self.window_size * self.window_size, c), h, w
+
+    def _tokens_to_windows(self, tokens, h, w):
+        windows = tokens.view(-1, self.window_size, self.window_size,
+                              self.channels)
+        x = window_reverse(windows, self.window_size, h, w)
+        return x.permute(0, 3, 1, 2).contiguous()
+
+    def forward(self, h, aux_feat, aux_edge):
+        if aux_feat is None:
+            return h
+        if aux_feat.shape[-2:] != h.shape[-2:]:
+            aux_feat = F.interpolate(
+                aux_feat, size=h.shape[-2:], mode='bilinear',
+                align_corners=False)
+        if aux_edge.shape[-2:] != h.shape[-2:]:
+            aux_edge = F.interpolate(
+                aux_edge, size=h.shape[-2:], mode='bilinear',
+                align_corners=False)
+
+        h_tokens, h_h, h_w = self._windows_to_tokens(h)
+        self_tokens = self.norm_self(h_tokens)
+        self_tokens, _ = self.self_attn(
+            self_tokens, self_tokens, self_tokens, need_weights=False)
+        h_mid_tokens = h_tokens + self_tokens
+
+        aux_tokens, _, _ = self._windows_to_tokens(aux_feat)
+        q = self.norm_q(h_mid_tokens)
+        kv = self.norm_kv(aux_tokens)
+        cross_tokens, _ = self.cross_attn(q, kv, kv, need_weights=False)
+        cross_feat = self._tokens_to_windows(cross_tokens, h_h, h_w)
+        cross_feat = self.proj(cross_feat)
+
+        h_mid = self._tokens_to_windows(h_mid_tokens, h_h, h_w)
+        gate = self.gate(torch.cat([h_mid, aux_feat, aux_edge], dim=1))
+        return h_mid + self.gamma * gate * cross_feat
+
 def window_partition(x, window_size):
     """
     Args:
@@ -801,8 +937,14 @@ class NewSwinUnetv3RestorationNet(nn.Module):
                  use_feature_wavelet_matching=False,
                  legacy_wav_concat=False, use_ref_hf_residual=False,
                  use_similarity_gate=False, zero_init_ref_hf=True,
-                 init_ref_hf_scale=1.0, max_ref_hf_scale=None):
+                 init_ref_hf_scale=1.0, max_ref_hf_scale=None,
+                 use_aux_albedo=False, aux_in_channels=3,
+                 aux_init_scale=0.01, aux_num_heads=4):
         super(NewSwinUnetv3RestorationNet, self).__init__()
+        self.use_aux_albedo = use_aux_albedo
+        if self.use_aux_albedo:
+            self.aux_encoder = AuxiliaryEncoder(
+                in_channels=aux_in_channels, feat_channels=ngf)
         self.content_extractor = ContentExtractor(
             in_nc=3, out_nc=3, nf=ngf, n_blocks=n_blocks)
         self.dyn_agg_restore = DynamicAggregationRestoration(
@@ -815,7 +957,11 @@ class NewSwinUnetv3RestorationNet(nn.Module):
             use_similarity_gate=use_similarity_gate,
             zero_init_ref_hf=zero_init_ref_hf,
             init_ref_hf_scale=init_ref_hf_scale,
-            max_ref_hf_scale=max_ref_hf_scale)
+            max_ref_hf_scale=max_ref_hf_scale,
+            use_aux_albedo=use_aux_albedo,
+            aux_init_scale=aux_init_scale,
+            aux_num_heads=aux_num_heads,
+            aux_window_size=window_size)
 
         arch_util.srntt_init_weights(self, init_type='normal', init_gain=0.02)
         self.re_init_dcn_offset()
@@ -833,7 +979,8 @@ class NewSwinUnetv3RestorationNet(nn.Module):
         self.dyn_agg_restore.up_large_dyn_agg.conv_offset_mask.weight.data.zero_()
         self.dyn_agg_restore.up_large_dyn_agg.conv_offset_mask.bias.data.zero_()
 
-    def forward(self, x, pre_offset_flow_sim, img_ref_feat, F_wav=None):  # 鈫?鏂板 F_wav
+    def forward(self, x, pre_offset_flow_sim, img_ref_feat, F_wav=None,
+                img_albedo=None):
         """
                 Args:
                     x (Tensor): img_in_lq, (B, 3, 40, 40)
@@ -846,7 +993,12 @@ class NewSwinUnetv3RestorationNet(nn.Module):
 
         base = F.interpolate(x, None, 4, 'bilinear', False)
         content_feat = self.content_extractor(x)
-        upscale_restore = self.dyn_agg_restore(base, content_feat, pre_offset_flow_sim, img_ref_feat, F_wav)
+        aux_feats = None
+        if self.use_aux_albedo and img_albedo is not None:
+            aux_feats = self.aux_encoder(img_albedo)
+        upscale_restore = self.dyn_agg_restore(
+            base, content_feat, pre_offset_flow_sim, img_ref_feat, F_wav,
+            aux_feats)
         return upscale_restore + base
 
     def reset_hf_stats(self):
@@ -893,6 +1045,10 @@ class DynamicAggregationRestoration(nn.Module):
                  zero_init_ref_hf=True,
                  init_ref_hf_scale=1.0,
                  max_ref_hf_scale=None,
+                 use_aux_albedo=False,
+                 aux_init_scale=0.01,
+                 aux_num_heads=4,
+                 aux_window_size=8,
                  ):
         super(DynamicAggregationRestoration, self).__init__()
         self.use_checkpoint = use_checkpoint
@@ -912,6 +1068,7 @@ class DynamicAggregationRestoration(nn.Module):
         self._hf_debug_maps = {}
         self._hf_stat_sums = defaultdict(float)
         self._hf_stat_counts = defaultdict(int)
+        self.use_aux_albedo = use_aux_albedo
         if not self.legacy_wav_concat and self.use_ref_hf_residual:
             self.ref_hf_scale = nn.Parameter(torch.zeros(1))
             if not zero_init_ref_hf:
@@ -1037,6 +1194,17 @@ class DynamicAggregationRestoration(nn.Module):
 
             self.wav_attn = ChannelAttention(ngf)
 
+        if self.use_aux_albedo:
+            self.aux_fusion_160 = AuxCrossModalityFusion(
+                ngf, window_size=aux_window_size, num_heads=aux_num_heads,
+                init_scale=aux_init_scale)
+            self.aux_fusion_80 = AuxCrossModalityFusion(
+                ngf, window_size=aux_window_size, num_heads=aux_num_heads,
+                init_scale=aux_init_scale)
+            self.aux_fusion_40 = AuxCrossModalityFusion(
+                ngf, window_size=aux_window_size, num_heads=aux_num_heads,
+                init_scale=aux_init_scale)
+
     def reset_hf_stats(self):
         self._hf_stat_sums = defaultdict(float)
         self._hf_stat_counts = defaultdict(int)
@@ -1145,7 +1313,8 @@ class DynamicAggregationRestoration(nn.Module):
 
         return output
 
-    def forward(self, base, x, pre_offset_flow_sim, img_ref_feat, F_wav=None):
+    def forward(self, base, x, pre_offset_flow_sim, img_ref_feat, F_wav=None,
+                aux_feats=None):
         """
         Args:
             base: (B, 3, 160, 160) 鈥?bicubic 涓婇噰鏍峰悗鐨?LR
@@ -1205,6 +1374,9 @@ class DynamicAggregationRestoration(nn.Module):
 
         h = torch.cat([x0, down_relu1_swapped_feat], 1)  # [B, ngf+64, 160, 160]
         h = self.down_head_large(h)  # [B, ngf, 160, 160]
+        if self.use_aux_albedo and aux_feats is not None:
+            h = self.aux_fusion_160(
+                h, aux_feats['feat']['160'], aux_feats['edge']['160'])
         h = self.down_body_large(h) + x0  # [B, ngf, 160, 160]
         x1 = self.down_tail_large(h)  # [B, ngf, 80, 80]
 
@@ -1232,6 +1404,9 @@ class DynamicAggregationRestoration(nn.Module):
         else:
             h = torch.cat([x1, down_relu2_swapped_feat], 1)  # [9, 256, 80, 80]
         h = self.down_head_medium(h)  # [9, 128, 80, 80]
+        if self.use_aux_albedo and aux_feats is not None:
+            h = self.aux_fusion_80(
+                h, aux_feats['feat']['80'], aux_feats['edge']['80'])
 
         # ---- 灏忔尝楂橀鐗瑰緛娉ㄥ叆 (encoder medium scale) ----
         if (not self.legacy_wav_concat and self.use_ref_hf_residual
@@ -1276,6 +1451,9 @@ class DynamicAggregationRestoration(nn.Module):
         # small scale
         h = torch.cat([x2, relu3_swapped_feat], 1)  # [B, ngf+256, 40, 40]
         h = self.up_head_small(h)  # [B, ngf, 40, 40]
+        if self.use_aux_albedo and aux_feats is not None:
+            h = self.aux_fusion_40(
+                h, aux_feats['feat']['40'], aux_feats['edge']['40'])
         h = self.up_body_small(h) + x2  # [B, ngf, 40, 40]
         x = self.up_tail_small(h)  # [B, ngf, 80, 80]
 

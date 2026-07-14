@@ -1,5 +1,4 @@
-# Stage C+: Stage B + bounded nonzero aligned reference high-frequency residual.
-name: train_datsr_wavelet_ref_hf_cplus_noisy
+name: train_datsr_mc_albedo_only_baseline
 use_tb_logger: true
 model_type: RefRestorationModel
 map_type: online_CUFED_swap
@@ -10,34 +9,34 @@ gpu_ids: [0]
 
 datasets:
   train:
-    name: CUFED_noisy
-    type: NoisyRefCUFEDDataset
-    dataroot_in: ./datasets/CUFED_noisy/input_noisy_sigma50
-    dataroot_ref: ./datasets/CUFED/ref
-    dataroot_gt: ./datasets/CUFED/input
+    name: MCRefSR_albedo_train
+    type: MCRefSRDataset
+    dataroot_in: datasets/train/input
+    dataroot_gt: datasets/train/gt
+    dataroot_ref: datasets/train/ref
+    dataroot_albedo: datasets/train/albedo
+    ref_source: albedo
     io_backend:
       type: disk
     gt_size: 160
     use_flip: true
     use_rot: true
-    use_ColorJitter: false
-    scale: 4
     use_shuffle: true
-    n_workers: 2
-    batch_size: 2
-    dataset_enlarge_ratio: 1000
+    n_workers: 8
+    batch_size: 4
+    dataset_enlarge_ratio: 100
 
   val:
-    name: CUFED5_sigma50
-    type: NoisyRefCUFEDDataset
-    dataroot_in: ./datasets/CUFED5_sigma50
-    dataroot_ref: ./datasets/CUFED5
-    dataroot_gt: ./datasets/CUFED5
+    name: MCRefSR_albedo_staircase_test
+    type: MCRefSRDataset
+    dataroot_in: datasets/test/input
+    dataroot_gt: datasets/test/gt
+    dataroot_ref: datasets/test/ref
+    dataroot_albedo: datasets/test/albedo
+    ref_source: albedo
     io_backend:
       type: disk
-    use_ColorJitter: false
-    ann_file: ./datasets/CUFED5_pairs.txt
-    scale: 4
+    window_size: 8
 
 network_g:
   type: NewSwinUnetv3RestorationNet
@@ -49,14 +48,11 @@ network_g:
   num_heads: [4, 4]
   window_size: 8
   use_checkpoint: true
-  wav_channels: 64
   K: 1
-  use_wavelet_ll_matching: true
-  use_ref_hf_residual: true
+  use_wavelet_ll_matching: false
+  use_feature_wavelet_matching: false
+  use_ref_hf_residual: false
   use_similarity_gate: false
-  zero_init_ref_hf: false
-  init_ref_hf_scale: 0.05
-  max_ref_hf_scale: 0.05
   legacy_wav_concat: false
 
 network_map:
@@ -69,12 +65,8 @@ network_map:
 network_extractor:
   type: ContrasExtractorSep
 
-network_wavelet:
-  type: WaveletFrequencyBranch
-  out_channels: 64
-
 path:
-  pretrain_model_g: experiments/train/train_datsr_wavelet_ll_matching_noisy/models/net_g_latest.pth
+  pretrain_model_g: ~
   pretrain_model_d: ~
   pretrain_model_feature_extractor: experiments/pretrained_model/feature_extraction.pth
   pretrain_model_wavelet: ~
@@ -83,11 +75,10 @@ path:
   root: experiments/train/
 
 train:
-  lr_g: !!float 5e-5
-  lr_offset: !!float 5e-5
-  lr_relu2_offset: !!float 5e-6
-  lr_relu3_offset: !!float 5e-7
-  lr_wavelet: !!float 2e-4
+  lr_g: !!float 1e-4
+  lr_offset: !!float 1e-4
+  lr_relu2_offset: !!float 1e-5
+  lr_relu3_offset: !!float 1e-6
   weight_decay_g: 0
   beta_g: [0.9, 0.999]
   lr_d: !!float 1e-4
@@ -97,8 +88,8 @@ train:
   niter: 100000
   warmup_iter: -1
   net_g_pretrain_steps: 0
-  lr_steps: [30000, 50000]
-  lr_gamma: 0.1
+  lr_steps: [30000, 60000, 85000]
+  lr_gamma: 0.5
   pixel_criterion: L1Loss
   pixel_weight: !!float 1.0
   manual_seed: 10
@@ -106,8 +97,10 @@ train:
   net_d_init_steps: 0
 
 val:
-  val_freq: !!float 5e3
-  save_img: false
+  val_freq: !!float 1e4
+  save_img: true
+  calculate_lpips: true
+  lpips_net: alex
 
 logger:
   print_freq: 100
@@ -115,4 +108,4 @@ logger:
 
 dist_params:
   backend: nccl
-  port: 29749
+  port: 29746

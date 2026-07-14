@@ -138,6 +138,58 @@ class MaskedTVLoss(L1Loss):
         return loss
 
 
+class EdgeLoss(nn.Module):
+    """Sobel gradient loss on luminance.
+
+    This loss compares first-order image gradients between SR and GT. It is
+    useful for fine-tuning an L1 baseline when edges look over-smoothed.
+    """
+
+    def __init__(self, loss_weight=0.05, criterion='l1'):
+        super(EdgeLoss, self).__init__()
+        self.loss_weight = loss_weight
+        self.criterion = criterion
+        if self.criterion not in ['l1', 'charbonnier']:
+            raise ValueError(f'Unsupported edge loss criterion: {criterion}')
+
+        sobel_x = torch.tensor(
+            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+            dtype=torch.float32).view(1, 1, 3, 3) / 8.0
+        sobel_y = torch.tensor(
+            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+            dtype=torch.float32).view(1, 1, 3, 3) / 8.0
+        self.register_buffer('sobel_x', sobel_x)
+        self.register_buffer('sobel_y', sobel_y)
+
+    @staticmethod
+    def _rgb_to_y(x):
+        if x.size(1) == 1:
+            return x
+        weight = x.new_tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)
+        return (x[:, :3, :, :] * weight).sum(dim=1, keepdim=True)
+
+    def _gradient(self, x):
+        y = self._rgb_to_y(x)
+        grad_x = F.conv2d(y, self.sobel_x, padding=1)
+        grad_y = F.conv2d(y, self.sobel_y, padding=1)
+        return grad_x, grad_y
+
+    def forward(self, pred, target):
+        pred_grad_x, pred_grad_y = self._gradient(pred)
+        target_grad_x, target_grad_y = self._gradient(target.detach())
+
+        if self.criterion == 'l1':
+            loss = (
+                F.l1_loss(pred_grad_x, target_grad_x) +
+                F.l1_loss(pred_grad_y, target_grad_y))
+        else:
+            loss = (
+                charbonnier_loss(pred_grad_x, target_grad_x).mean() +
+                charbonnier_loss(pred_grad_y, target_grad_y).mean())
+
+        return self.loss_weight * loss
+
+
 class PerceptualLoss(nn.Module):
     """Perceptual loss with commonly used style loss.
 

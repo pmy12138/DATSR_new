@@ -66,6 +66,30 @@ def psnr(img1, img2, crop_border=0, input_order='HWC'):
     return 20. * np.log10(255. / np.sqrt(mse))
 
 
+def rel_mse(img1, img2, crop_border=0, input_order='HWC', eps=1e-12):
+    """Calculate relative mean squared error.
+
+    The result is computed as ``sum((img1 - img2)^2) / sum(img2^2)``.
+    It is useful for Monte Carlo rendering evaluation, where relative
+    radiance/color error is often reported together with PSNR.
+    """
+
+    assert img1.shape == img2.shape, (
+        f'Image shapes are differnet: {img1.shape}, {img2.shape}.')
+    if input_order not in ['HWC', 'CHW']:
+        raise ValueError(
+            f'Wrong input_order {input_order}. Supported input_orders are '
+            '"HWC" and "CHW"')
+    img1 = reorder_image(img1, input_order=input_order).astype(np.float64)
+    img2 = reorder_image(img2, input_order=input_order).astype(np.float64)
+
+    if crop_border != 0:
+        img1 = img1[crop_border:-crop_border, crop_border:-crop_border, ...]
+        img2 = img2[crop_border:-crop_border, crop_border:-crop_border, ...]
+
+    return np.sum((img1 - img2)**2) / (np.sum(img2**2) + eps)
+
+
 def _ssim(img1, img2):
     """Calculate SSIM (structural similarity) for one channel images.
 
@@ -166,4 +190,3 @@ def bgr2ycbcr(img, only_y=True):
     else:
         rlt /= 255.
     return rlt.astype(in_img_type)
-

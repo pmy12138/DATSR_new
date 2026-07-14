@@ -1,0 +1,62 @@
+name: test_datsr_mc_refsr_no_albedo_geometry_crop_scene_split
+suffix: ~
+scale: 4
+model_type: RefRestorationModel
+set_CUDA_VISIBLE_DEVICES: ~
+crop_border: 4
+gpu_ids: [0]
+
+datasets:
+  test:
+    name: MCRefSR_no_albedo_geometry_trained_classroom_staircase_test
+    type: MCRefSRDataset
+    dataroot_in: datasets/test/input
+    dataroot_gt: datasets/test/gt
+    dataroot_ref: datasets/test/ref
+    use_albedo: false
+    ref_mode: normal
+    use_geometry_ref_crop: false
+    io_backend:
+      type: disk
+    window_size: 8
+
+val_func: BasicSRValidation
+save_img: true
+calculate_lpips: true
+lpips_net: alex
+
+network_g:
+  type: NewSwinUnetv3RestorationNet
+  ngf: 128
+  n_blocks: 8
+  groups: 8
+  embed_dim: 128
+  depths: [4, 4]
+  num_heads: [4, 4]
+  window_size: 8
+  use_checkpoint: true
+  K: 1
+  use_aux_albedo: false
+  use_wavelet_ll_matching: false
+  use_feature_wavelet_matching: false
+  use_ref_hf_residual: false
+  use_similarity_gate: false
+  legacy_wav_concat: false
+
+network_map:
+  type: FlowSimCorrespondenceGenerationArch
+  patch_size: 3
+  stride: 1
+  vgg_layer_list: ['relu1_1', 'relu2_1', 'relu3_1']
+  vgg_type: vgg19
+
+network_extractor:
+  type: ContrasExtractorSep
+
+path:
+  pretrain_model_g: experiments/train/train_datsr_mc_refsr_no_albedo_geometry_crop_scene_split/models/net_g_40000.pth
+  pretrain_model_d: ~
+  pretrain_model_feature_extractor: experiments/pretrained_model/feature_extraction.pth
+  pretrain_model_wavelet: ~
+  strict_load: true
+  root: experiments/test/

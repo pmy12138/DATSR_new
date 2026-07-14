@@ -1,0 +1,127 @@
+name: train_datsr_mc_refsr_percep_edge
+use_tb_logger: true
+model_type: RefRestorationModel
+map_type: online_CUFED_swap
+scale: 4
+crop_border: ~
+set_CUDA_VISIBLE_DEVICES: ~
+gpu_ids: [0]
+
+datasets:
+  train:
+    name: MCRefSR_train
+    type: MCRefSRDataset
+    dataroot_in: datasets/train/input
+    dataroot_gt: datasets/train/gt
+    dataroot_ref: datasets/train/ref
+    io_backend:
+      type: disk
+    gt_size: 160
+    use_flip: true
+    use_rot: true
+    # Single-reference MC training: repeatedly sample different patches from
+    # the same image/ref pair to compensate for the small number of scenes.
+    sample_enlarge_ratio: 300
+    lq_noise_aug: true
+    lq_noise_aug_sigma_max: !!float 3.92e-3
+    use_shuffle: true
+    n_workers: 8
+    batch_size: 4
+    dataset_enlarge_ratio: 1
+
+  val:
+    name: MCRefSR_staircase_test
+    type: MCRefSRDataset
+    dataroot_in: datasets/test/input
+    dataroot_gt: datasets/test/gt
+    dataroot_ref: datasets/test/ref
+    io_backend:
+      type: disk
+    window_size: 8
+
+network_g:
+  type: NewSwinUnetv3RestorationNet
+  ngf: 128
+  n_blocks: 8
+  groups: 8
+  embed_dim: 128
+  depths: [4, 4]
+  num_heads: [4, 4]
+  window_size: 8
+  use_checkpoint: true
+  K: 1
+  use_wavelet_ll_matching: false
+  use_feature_wavelet_matching: false
+  use_ref_hf_residual: false
+  use_similarity_gate: false
+  legacy_wav_concat: false
+
+network_map:
+  type: FlowSimCorrespondenceGenerationArch
+  patch_size: 3
+  stride: 1
+  vgg_layer_list: ['relu1_1', 'relu2_1', 'relu3_1']
+  vgg_type: 'vgg19'
+
+network_extractor:
+  type: ContrasExtractorSep
+
+path:
+  pretrain_model_g: experiments/train/train_datsr_mc_refsr_baseline/models/net_g_latest.pth
+  pretrain_model_d: ~
+  pretrain_model_feature_extractor: experiments/pretrained_model/feature_extraction.pth
+  pretrain_model_wavelet: ~
+  strict_load: false
+  resume_state: ~
+  root: experiments/train/
+
+train:
+  lr_g: !!float 5e-5
+  lr_offset: !!float 5e-5
+  lr_relu2_offset: !!float 5e-6
+  lr_relu3_offset: !!float 5e-7
+  weight_decay_g: 0
+  beta_g: [0.9, 0.999]
+  lr_d: !!float 1e-4
+  weight_decay_d: 0
+  beta_d: [0.9, 0.999]
+  lr_scheme: MultiStepLR
+  niter: 50000
+  warmup_iter: -1
+  net_g_pretrain_steps: 0
+  lr_steps: [20000, 35000, 45000]
+  lr_gamma: 0.5
+  pixel_criterion: L1Loss
+  pixel_weight: !!float 1.0
+  perceptual_opt:
+    layer_weights:
+      'relu2_1': 0.1
+      'relu3_1': 1.0
+      'relu4_1': 1.0
+    vgg_type: vgg19
+    use_input_norm: true
+    perceptual_weight: !!float 1e-4
+    style_weight: 0
+    norm_img: false
+    criterion: l1
+  edge_opt:
+    type: EdgeLoss
+    loss_weight: !!float 5e-2
+    criterion: l1
+  manual_seed: 10
+  net_d_steps: 1
+  net_d_init_steps: 0
+
+val:
+  val_freq: !!float 1e4
+  save_img: true
+  calculate_lpips: true
+  lpips_net: alex
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: !!float 5e3
+
+dist_params:
+  backend: nccl
+  port: 29746
