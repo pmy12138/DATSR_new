@@ -57,7 +57,8 @@ class MCRefSRDataset(data.Dataset):
         input/  noisy LR images, e.g. 320x180
         gt/     clean HR targets, e.g. 1280x720
         ref/    clean HR reference images from a different view
-        albedo/ optional HR albedo maps for albedo-only experiments
+        albedo/ optional HR albedo maps
+        normal/ optional HR surface-normal maps
 
     Returned fields follow RefRestorationModel:
         img_in_lq: noisy LR input
@@ -76,19 +77,24 @@ class MCRefSRDataset(data.Dataset):
         self.gt_folder = _resolve_dataroot(opt['dataroot_gt'])
         self.ref_folder = _resolve_dataroot(opt.get('dataroot_ref', None))
         self.albedo_folder = _resolve_dataroot(opt.get('dataroot_albedo', None))
+        self.normal_folder = _resolve_dataroot(opt.get('dataroot_normal', None))
         self.ref_source = opt.get('ref_source', 'ref')
         self.ref_mode = opt.get('ref_mode', 'normal')
         self.ref_shuffle_offset = opt.get('ref_shuffle_offset', None)
         if self.ref_shuffle_offset is not None:
             self.ref_shuffle_offset = int(self.ref_shuffle_offset)
         self.use_albedo = opt.get('use_albedo', False)
+        self.use_normal = opt.get('use_normal', False)
         self.use_matching_geo_prior = opt.get('use_matching_geo_prior', False)
         self.matching_geo_mode = opt.get('matching_geo_mode', 'depth')
         self.use_projective_matching = (
             self.use_matching_geo_prior
-            and self.matching_geo_mode == 'projective_window')
+            and self.matching_geo_mode in [
+                'projective_window', 'projective_soft_prior'])
         self.albedo_mode = opt.get('albedo_mode', 'normal')
         self.albedo_shuffle_offset = int(opt.get('albedo_shuffle_offset', 1))
+        self.normal_mode = opt.get('normal_mode', 'normal')
+        self.normal_shuffle_offset = int(opt.get('normal_shuffle_offset', 1))
         self.test_filenames = opt.get('test_filenames', None)
         self.sample_enlarge_ratio = int(opt.get('sample_enlarge_ratio', 1))
         self.sample_enlarge_ratio = max(self.sample_enlarge_ratio, 1)
@@ -185,10 +191,21 @@ class MCRefSRDataset(data.Dataset):
                 'Ref ablation modes are only supported when ref_source=ref.')
         if self.use_albedo and self.albedo_folder is None:
             raise ValueError('dataroot_albedo is required when use_albedo=True.')
+        if self.use_normal and self.normal_folder is None:
+            raise ValueError('dataroot_normal is required when use_normal=True.')
+        if (self.use_normal and (opt.get('use_flip', False)
+                                 or opt.get('use_rot', False))):
+            raise ValueError(
+                'Disable use_flip/use_rot when use_normal=True. Spatially '
+                'flipping or rotating a normal map also requires transforming '
+                'its vector components, which the generic image augment does '
+                'not perform.')
         if self.use_matching_geo_prior:
-            if self.matching_geo_mode not in ['depth', 'projective_window']:
+            if self.matching_geo_mode not in [
+                    'depth', 'projective_window', 'projective_soft_prior']:
                 raise ValueError(
-                    'matching_geo_mode must be depth or projective_window.')
+                    'matching_geo_mode must be depth, projective_window, or '
+                    'projective_soft_prior.')
             if (self.matching_geo_mode == 'depth'
                     and self.guidance_depth_folder is None):
                 raise ValueError(
@@ -197,21 +214,21 @@ class MCRefSRDataset(data.Dataset):
             if (self.use_projective_matching and opt.get('phase') == 'train'
                     and not self.use_geometry_ref_crop):
                 raise ValueError(
-                    'Training with projective_window currently requires '
+                    'Training with projective matching currently requires '
                     'use_geometry_ref_crop=True so target/Ref crop transforms '
                     'remain known.')
             if (self.use_projective_matching
                     and (opt.get('use_flip', False)
                          or opt.get('use_rot', False))):
                 raise ValueError(
-                    'Disable use_flip/use_rot for projective_window matching; '
+                    'Disable use_flip/use_rot for projective matching; '
                     'camera-projected coordinates must stay in the original '
                     'image orientation.')
             if (self.geometry_use_ref_depth_consistency
                     and not self.use_projective_matching):
                 raise ValueError(
                     'Ref-depth consistency is only supported by '
-                    'matching_geo_mode=projective_window.')
+                    'projective matching modes.')
             if (self.geometry_depth_consistency_rel_tol < 0
                     or self.geometry_depth_consistency_abs_tol < 0):
                 raise ValueError(
@@ -219,6 +236,10 @@ class MCRefSRDataset(data.Dataset):
         if self.albedo_mode not in ['normal', 'zero', 'shuffled']:
             raise ValueError(
                 f'Unsupported albedo_mode: {self.albedo_mode}. '
+                'Supported choices are normal, zero and shuffled.')
+        if self.normal_mode not in ['normal', 'zero', 'shuffled']:
+            raise ValueError(
+                f'Unsupported normal_mode: {self.normal_mode}. '
                 'Supported choices are normal, zero and shuffled.')
         self.filename_tmpl = opt.get('filename_tmpl', '{}')
         self.dataset_root = None
@@ -237,6 +258,7 @@ class MCRefSRDataset(data.Dataset):
         missing_metric_depth = []
         missing_camera_manifest = []
         missing_matching_geo = []
+        missing_normal = []
         for name in names:
             in_path = os.path.join(self.in_folder, name)
             gt_path = os.path.join(self.gt_folder, name)
@@ -245,10 +267,14 @@ class MCRefSRDataset(data.Dataset):
             else:
                 ref_path = os.path.join(self.ref_folder, name)
             albedo_path = os.path.join(self.albedo_folder, name) if self.use_albedo else None
+            normal_path = os.path.join(self.normal_folder, name) if self.use_normal else None
             metric_depth_path = self._find_metric_depth(name)
             ref_metric_depth_path = self._find_ref_metric_depth(name)
             guidance_depth_path = self._find_guidance_depth(name)
             has_albedo = (not self.use_albedo or os.path.exists(albedo_path))
+            has_normal = (not self.use_normal or os.path.exists(normal_path))
+            if not has_normal:
+                missing_normal.append(name)
             has_metric_depth = metric_depth_path is not None
             needs_camera = self.use_geometry_ref_crop or self.use_projective_matching
             has_camera_manifest = (
@@ -271,12 +297,14 @@ class MCRefSRDataset(data.Dataset):
             if self.use_matching_geo_prior and not has_matching_geo:
                 missing_matching_geo.append(name)
             if (os.path.exists(gt_path) and os.path.exists(ref_path)
-                    and has_albedo and has_geometry and has_matching_geo):
+                    and has_albedo and has_normal and has_geometry
+                    and has_matching_geo):
                 self.paths.append({
                     'in_path': in_path,
                     'gt_path': gt_path,
                     'ref_path': ref_path,
                     'albedo_path': albedo_path,
+                    'normal_path': normal_path,
                     'depth_path': metric_depth_path,
                     'ref_depth_path': ref_metric_depth_path,
                     'guidance_depth_path': guidance_depth_path,
@@ -309,6 +337,12 @@ class MCRefSRDataset(data.Dataset):
                 f'{len(missing_matching_geo)} input images are missing depth '
                 f'guidance maps required by use_matching_geo_prior '
                 f'(examples: {preview}).')
+        if self.use_normal and missing_normal:
+            preview = ', '.join(missing_normal[:5])
+            raise ValueError(
+                f'{len(missing_normal)} input images are missing paired normal '
+                f'maps (examples: {preview}). Resolved normal root: '
+                f'{self.normal_folder}.')
 
         if not self.paths:
             if self.use_geometry_ref_crop:
@@ -335,6 +369,10 @@ class MCRefSRDataset(data.Dataset):
                 and len(self.paths) < 2):
             raise ValueError(
                 'albedo_mode=shuffled requires at least two paired samples.')
+        if (self.use_normal and self.normal_mode == 'shuffled'
+                and len(self.paths) < 2):
+            raise ValueError(
+                'normal_mode=shuffled requires at least two paired samples.')
         if self.ref_mode == 'shuffled' and len(self.paths) < 2:
             raise ValueError(
                 'ref_mode=shuffled requires at least two paired samples.')
@@ -397,7 +435,7 @@ class MCRefSRDataset(data.Dataset):
         return None
 
     def _geometry_random_crop(self, img_gt, img_lq, img_ref, img_albedo,
-                              img_depth,
+                              img_normal, img_depth,
                               path_info, gt_size, scale):
         if gt_size % scale != 0:
             raise ValueError(
@@ -503,6 +541,9 @@ class MCRefSRDataset(data.Dataset):
         if img_albedo is not None:
             img_albedo = img_albedo[top_gt:top_gt + gt_size,
                                     left_gt:left_gt + gt_size]
+        if img_normal is not None:
+            img_normal = img_normal[top_gt:top_gt + gt_size,
+                                    left_gt:left_gt + gt_size]
         if img_depth is not None:
             img_depth = img_depth[top_gt:top_gt + gt_size,
                                   left_gt:left_gt + gt_size]
@@ -546,7 +587,7 @@ class MCRefSRDataset(data.Dataset):
                     self.geometry_depth_consistency_rel_tol),
                 depth_consistency_abs_tol=(
                     self.geometry_depth_consistency_abs_tol))
-        return (img_gt, img_lq, img_ref, img_albedo, img_depth,
+        return (img_gt, img_lq, img_ref, img_albedo, img_normal, img_depth,
                 geometry_info, geo_ref_coords, geo_valid_mask)
 
     def _read_img(self, path, key):
@@ -619,6 +660,18 @@ class MCRefSRDataset(data.Dataset):
                 albedo_path = self.paths[
                     (base_index + offset) % len(self.paths)]['albedo_path']
             img_albedo = self._read_img(albedo_path, 'albedo')
+        if not self.use_normal:
+            img_normal = None
+        elif self.normal_mode == 'zero':
+            img_normal = np.zeros_like(img_gt)
+        else:
+            normal_path = path_info['normal_path']
+            if self.normal_mode == 'shuffled':
+                offset = self.normal_shuffle_offset % len(self.paths)
+                offset = offset if offset != 0 else 1
+                normal_path = self.paths[
+                    (base_index + offset) % len(self.paths)]['normal_path']
+            img_normal = self._read_img(normal_path, 'normal')
         if self.use_projective_matching:
             img_depth = read_metric_depth(
                 path_info['depth_path']).astype(np.float32)[..., None]
@@ -633,6 +686,8 @@ class MCRefSRDataset(data.Dataset):
         img_ref = self._resize_to(img_ref, img_gt.shape[:2])
         if img_albedo is not None:
             img_albedo = self._resize_to(img_albedo, img_gt.shape[:2])
+        if img_normal is not None:
+            img_normal = self._resize_to(img_normal, img_gt.shape[:2])
         if img_depth is not None:
             img_depth = self._resize_depth_to(img_depth, img_gt.shape[:2])
         full_ref_size = img_ref.shape[:2]
@@ -656,15 +711,18 @@ class MCRefSRDataset(data.Dataset):
             gt_size = self.opt['gt_size']
             geometry_info = None
             if self.use_geometry_ref_crop:
-                (img_gt, img_lq, img_ref, img_albedo, img_depth,
+                (img_gt, img_lq, img_ref, img_albedo, img_normal, img_depth,
                  geometry_info, geo_ref_coords, geo_valid_mask) = \
                     self._geometry_random_crop(
-                        img_gt, img_lq, img_ref, img_albedo, img_depth,
+                        img_gt, img_lq, img_ref, img_albedo, img_normal,
+                        img_depth,
                         path_info, gt_size, scale)
             else:
                 gt_list = [img_gt, img_ref]
                 if img_albedo is not None:
                     gt_list.append(img_albedo)
+                if img_normal is not None:
+                    gt_list.append(img_normal)
                 if img_depth is not None:
                     gt_list.append(img_depth)
                 img_gts, img_lq = paired_random_crop(
@@ -674,6 +732,9 @@ class MCRefSRDataset(data.Dataset):
                 next_index = 2
                 if img_albedo is not None:
                     img_albedo = img_gts[next_index]
+                    next_index += 1
+                if img_normal is not None:
+                    img_normal = img_gts[next_index]
                     next_index += 1
                 if img_depth is not None:
                     img_depth = img_gts[next_index]
@@ -714,6 +775,8 @@ class MCRefSRDataset(data.Dataset):
             img_ref = img_ref[:h_gt, :w_gt, :]
             if img_albedo is not None:
                 img_albedo = img_albedo[:h_gt, :w_gt, :]
+            if img_normal is not None:
+                img_normal = img_normal[:h_gt, :w_gt, :]
             if img_depth is not None:
                 img_depth = img_depth[:h_gt, :w_gt, :]
             if self.use_projective_matching:
@@ -741,6 +804,8 @@ class MCRefSRDataset(data.Dataset):
         tensor_list = [img_gt, img_lq, img_in_up, img_ref]
         if img_albedo is not None:
             tensor_list.append(img_albedo)
+        if img_normal is not None:
+            tensor_list.append(img_normal)
         if img_depth is not None:
             tensor_list.append(img_depth)
         tensor_list = totensor(
@@ -751,6 +816,9 @@ class MCRefSRDataset(data.Dataset):
         next_index = 4
         if img_albedo is not None:
             img_albedo = tensor_list[next_index]
+            next_index += 1
+        if img_normal is not None:
+            img_normal = tensor_list[next_index]
             next_index += 1
         if img_depth is not None:
             img_depth = tensor_list[next_index]
@@ -763,6 +831,8 @@ class MCRefSRDataset(data.Dataset):
         }
         if img_albedo is not None:
             return_dict['img_albedo'] = img_albedo
+        if img_normal is not None:
+            return_dict['img_normal'] = img_normal
         if img_depth is not None:
             return_dict['img_depth'] = img_depth
         if geo_ref_coords is not None:

@@ -34,6 +34,9 @@ class RefRestorationModel(SRModel):
         self.net_extractor = networks.define_net_extractor(opt)
         self.net_extractor = self.model_to_device(self.net_extractor)
         self.print_network(self.net_extractor)
+        self.freeze_feature_extractor = bool(
+            self.opt.get('train', {}).get(
+                'freeze_feature_extractor', False))
 
         # ===== 新增: 小波频域分支 =====  
         self.net_wavelet = networks.define_net_wavelet(opt)
@@ -53,6 +56,10 @@ class RefRestorationModel(SRModel):
         if load_path is not None:
             self.load_network(self.net_extractor, load_path,
                               self.opt['path']['strict_load'])
+        if self.freeze_feature_extractor:
+            for parameter in self.net_extractor.parameters():
+                parameter.requires_grad = False
+            self.net_extractor.eval()
 
             # load pretrained models
         load_path = self.opt['path'].get('pretrain_model_g', None)
@@ -68,16 +75,34 @@ class RefRestorationModel(SRModel):
 
             # optimizers  
             train_opt = self.opt['train']
+            self.matching_loss_weight = float(
+                train_opt.get('matching_loss_weight', 0.0))
+            self.projection_loss_weight = float(
+                train_opt.get('projection_loss_weight', 0.0))
+            self.use_matching_auxiliary = (
+                self.matching_loss_weight > 0
+                or self.projection_loss_weight > 0)
+            if (self.freeze_feature_extractor
+                    and self.use_matching_auxiliary):
+                raise ValueError(
+                    'freeze_feature_extractor=True requires '
+                    'matching_loss_weight=0 and projection_loss_weight=0; '
+                    'the auxiliary matching losses have no trainable target '
+                    'when the extractor is frozen.')
             weight_decay_g = train_opt.get('weight_decay_g', 0)
             optim_params_g = []
             optim_params_offset = []
             optim_params_relu2_offset = []
             optim_params_relu3_offset = []
+            optim_params_aux_normal = []
             if train_opt.get('lr_relu3_offset', None):
                 optim_params_relu3_offset = []
             for name, v in self.net_g.named_parameters():
                 if v.requires_grad:
-                    if 'offset' in name:
+                    if ('normal_encoder' in name
+                            or 'aux_frontend_fusion' in name):
+                        optim_params_aux_normal.append(v)
+                    elif 'offset' in name:
                         if 'small' in name:
                             logger.info(name)
                             optim_params_relu3_offset.append(v)
@@ -95,19 +120,41 @@ class RefRestorationModel(SRModel):
             else:
                 optim_params_wavelet = []
 
+            optim_groups = [{
+                'params': optim_params_g + optim_params_wavelet
+            }, {
+                'params': optim_params_offset,
+                'lr': train_opt['lr_offset']
+            }, {
+                'params': optim_params_relu3_offset,
+                'lr': train_opt['lr_relu3_offset']
+            }, {
+                'params': optim_params_relu2_offset,
+                'lr': train_opt['lr_relu2_offset']
+            }]
+            if optim_params_aux_normal:
+                optim_groups.append({
+                    'params': optim_params_aux_normal,
+                    'lr': train_opt.get('lr_aux_normal', train_opt['lr_g'])
+                })
+            if self.use_matching_auxiliary:
+                extractor_params = [
+                    parameter for parameter in self.net_extractor.parameters()
+                    if parameter.requires_grad
+                ]
+                if not extractor_params:
+                    raise RuntimeError(
+                        'Matching/projection losses are enabled, but the '
+                        'feature extractor has no trainable parameters.')
+                optim_groups.append({
+                    'params': extractor_params,
+                    'lr': train_opt.get(
+                        'lr_feature_extractor', train_opt['lr_g'])
+                })
+                self.net_extractor.train()
+
             self.optimizer_g = torch.optim.Adam(
-                [{
-                    'params': optim_params_g + optim_params_wavelet
-                }, {
-                    'params': optim_params_offset,
-                    'lr': train_opt['lr_offset']
-                }, {
-                    'params': optim_params_relu3_offset,
-                    'lr': train_opt['lr_relu3_offset']
-                }, {
-                    'params': optim_params_relu2_offset,
-                    'lr': train_opt['lr_relu2_offset']
-                }],
+                optim_groups,
                 lr=train_opt['lr_g'],
                 weight_decay=weight_decay_g,
                 betas=train_opt['beta_g'])
@@ -227,6 +274,7 @@ class RefRestorationModel(SRModel):
         self.gt = data['img_in'].to(self.device)  # gt  
         self.match_img_in = data['img_in_up'].to(self.device)
         self.img_albedo = data['img_albedo'].to(self.device) if 'img_albedo' in data else None
+        self.img_normal = data['img_normal'].to(self.device) if 'img_normal' in data else None
         self.img_depth = data['img_depth'].to(self.device) if 'img_depth' in data else None
         self.geo_ref_coords = (data['geo_ref_coords'].to(self.device)
                                if 'geo_ref_coords' in data else None)
@@ -238,6 +286,10 @@ class RefRestorationModel(SRModel):
     def _get_net_wavelet_module(self):
         return (self.net_wavelet.module
                 if hasattr(self.net_wavelet, 'module') else self.net_wavelet)
+
+    def _get_net_map_module(self):
+        return (self.net_map.module
+                if hasattr(self.net_map, 'module') else self.net_map)
 
     def _legacy_wavelet_forward(self):
         """小波频域分支的前向传播  
@@ -293,7 +345,7 @@ class RefRestorationModel(SRModel):
 
         return pre_offset_flow_sim_up, img_ref_feat, F_wav
 
-    def _wavelet_forward(self):
+    def _wavelet_forward(self, compute_matching_auxiliary=False):
         """Build correspondence and optional aligned reference HF features."""
         highfreq_r = None
         needs_upsample = False
@@ -319,13 +371,15 @@ class RefRestorationModel(SRModel):
                 needs_upsample = True
             pre_offset_flow_sim, img_ref_feat = self.net_map(
                 features, self.img_ref, self.img_depth,
-                self.geo_ref_coords, self.geo_valid_mask)
+                self.geo_ref_coords, self.geo_valid_mask,
+                compute_matching_auxiliary)
             hf_flow_key = 'relu1_1'
         else:
             features = self.net_extractor(self.match_img_in, self.img_ref)
             pre_offset_flow_sim, img_ref_feat = self.net_map(
                 features, self.img_ref, self.img_depth,
-                self.geo_ref_coords, self.geo_valid_mask)
+                self.geo_ref_coords, self.geo_valid_mask,
+                compute_matching_auxiliary)
             hf_flow_key = 'relu2_1'
 
         pre_offset = pre_offset_flow_sim[0]
@@ -353,11 +407,13 @@ class RefRestorationModel(SRModel):
     def optimize_parameters(self, step):
 
         # ===== 小波频域 + 空域串行 =====  
-        pre_offset_flow_sim, img_ref_feat, F_wav = self._wavelet_forward()
+        pre_offset_flow_sim, img_ref_feat, F_wav = self._wavelet_forward(
+            compute_matching_auxiliary=self.use_matching_auxiliary)
 
         # 空域分支: DATSR 主网络  
         self.output = self.net_g(self.img_in_lq, pre_offset_flow_sim,
-                                 img_ref_feat, F_wav, self.img_albedo)
+                                 img_ref_feat, F_wav, self.img_albedo,
+                                 self.img_normal)
 
         if step <= self.net_g_pretrain_steps:
             # pretrain the net_g with pixel Loss  
@@ -423,6 +479,30 @@ class RefRestorationModel(SRModel):
                     l_g_total += l_g_texture
                     self.log_dict['l_g_texture'] = l_g_texture.item()
 
+                if self.use_matching_auxiliary:
+                    auxiliary = self._get_net_map_module().get_matching_aux_losses()
+                    if not auxiliary:
+                        raise RuntimeError(
+                            'Matching/projection losses are enabled, but '
+                            'network_map did not return auxiliary losses.')
+                    if self.matching_loss_weight > 0:
+                        l_g_matching = (
+                            self.matching_loss_weight
+                            * auxiliary['matching'])
+                        l_g_total += l_g_matching
+                        self.log_dict['l_g_matching'] = l_g_matching.item()
+                    if self.projection_loss_weight > 0:
+                        l_g_projection = (
+                            self.projection_loss_weight
+                            * auxiliary['projection'])
+                        l_g_total += l_g_projection
+                        self.log_dict['l_g_projection'] = \
+                            l_g_projection.item()
+                    self.log_dict['geometry_valid_ratio'] = \
+                        auxiliary['valid_ratio'].item()
+                    self.log_dict['geometry_confidence_mean'] = \
+                        auxiliary['confidence_mean'].item()
+
                 if self.net_d:
                     fake_g_pred = self.net_d(self.output)
                     l_g_gan = self.cri_gan(fake_g_pred, True, is_disc=False)
@@ -434,6 +514,7 @@ class RefRestorationModel(SRModel):
 
     def test(self):
         self.net_g.eval()
+        self.net_extractor.eval()
         net_g_module = self.net_g.module if hasattr(self.net_g, 'module') else self.net_g
         collect_hf_stats = self.opt.get('val', {}).get(
             'collect_hf_stats', False) or self.opt.get(
@@ -443,8 +524,11 @@ class RefRestorationModel(SRModel):
         with torch.no_grad():
             pre_offset_flow_sim, img_ref_feat, F_wav = self._wavelet_forward()
             self.output = self.net_g(self.img_in_lq, pre_offset_flow_sim,
-                                     img_ref_feat, F_wav, self.img_albedo)
+                                     img_ref_feat, F_wav, self.img_albedo,
+                                     self.img_normal)
         self.net_g.train()
+        if self.is_train and not self.freeze_feature_extractor:
+            self.net_extractor.train()
 
     def get_current_visuals(self):
         out_dict = OrderedDict()
@@ -458,6 +542,9 @@ class RefRestorationModel(SRModel):
         self.save_network(self.net_g, 'net_g', current_iter)
         # 保存小波分支  
         self.save_network(self.net_wavelet, 'net_wavelet', current_iter)
+        if getattr(self, 'use_matching_auxiliary', False):
+            self.save_network(
+                self.net_extractor, 'net_extractor', current_iter)
         if self.net_d:
             self.save_network(self.net_d, 'net_d', current_iter)
         self.save_training_state(epoch, current_iter)

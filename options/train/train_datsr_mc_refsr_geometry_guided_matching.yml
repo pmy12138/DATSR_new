@@ -1,4 +1,4 @@
-name: train_datsr_mc_refsr_geometry_guided_matching
+name: finetune_datsr_mc_geometry_soft_valid_percep_edge_extractor_10k_from_baseline
 use_tb_logger: true
 model_type: RefRestorationModel
 map_type: online_CUFED_swap
@@ -9,7 +9,7 @@ gpu_ids: [0]
 
 datasets:
   train:
-    name: MCRefSR_geometry_crop_and_guided_matching_train
+    name: MCRefSR_geometry_soft_valid_percep_edge_extractor_train
     type: MCRefSRDataset
     dataroot_in: datasets/train/input
     dataroot_gt: datasets/train/gt
@@ -20,7 +20,7 @@ datasets:
     ref_mode: normal
     use_geometry_ref_crop: true
     use_matching_geo_prior: true
-    matching_geo_mode: projective_window
+    matching_geo_mode: projective_soft_prior
     geometry_depth_type: ray_distance
     # Enable only after train/ref PFMs are confirmed scalar metric depth.
     geometry_use_ref_depth_consistency: false
@@ -52,7 +52,7 @@ datasets:
     dataset_enlarge_ratio: 1
 
   val:
-    name: MCRefSR_geometry_guided_matching_val
+    name: MCRefSR_geometry_soft_valid_percep_edge_extractor_val
     type: MCRefSRDataset
     dataroot_in: datasets/test/input
     dataroot_gt: datasets/test/gt
@@ -63,7 +63,7 @@ datasets:
     ref_mode: normal
     use_geometry_ref_crop: false
     use_matching_geo_prior: true
-    matching_geo_mode: projective_window
+    matching_geo_mode: projective_soft_prior
     geometry_depth_type: ray_distance
     geometry_use_ref_depth_consistency: false
     geometry_depth_consistency_rel_tol: 0.05
@@ -98,19 +98,24 @@ network_map:
   vgg_layer_list: ['relu1_1', 'relu2_1', 'relu3_1']
   vgg_type: vgg19
   use_matching_geo_prior: true
-  matching_geo_mode: projective_window
-  # Radius is measured on the relu3_1 Ref patch grid (4 = about 16 HR pixels).
-  geometry_search_radius: 4
-  # Soft preference inside the hard window; 0 disables this term.
-  geometry_position_weight: 0.05
-  geometry_position_sigma: 2.0
+  matching_geo_mode: projective_soft_prior
+  # All Ref patches remain candidates; geometry changes their matching score.
+  geometry_soft_prior_strength: 1.0
+  geometry_soft_prior_sigma: 0.1
+  geometry_confidence_mode: valid_mask
+  geometry_depth_edge_scale: 0.5
+  geometry_depth_edge_floor: 0.1
+  geometry_auxiliary_logit_scale: 10.0
+  geometry_auxiliary_max_queries: 512
   normalize_similarity: false
 
 network_extractor:
   type: ContrasExtractorSep
 
 path:
-  pretrain_model_g: ~
+  # Start from the same 40k generator and original DATSR extractor. Geometry
+  # matching/projection losses below fine-tune and save the extractor again.
+  pretrain_model_g: experiments/train/train_datsr_mc_refsr_baseline/models/net_g_40000.pth
   pretrain_model_d: ~
   pretrain_model_feature_extractor: experiments/pretrained_model/feature_extraction.pth
   pretrain_model_wavelet: ~
@@ -119,20 +124,23 @@ path:
   root: experiments/train/
 
 train:
-  lr_g: !!float 1e-4
-  lr_offset: !!float 1e-4
-  lr_relu2_offset: !!float 1e-5
-  lr_relu3_offset: !!float 1e-6
+  # Match the effective learning-rate scale at the end of baseline training.
+  lr_g: !!float 1.25e-5
+  lr_offset: !!float 1.25e-5
+  lr_relu2_offset: !!float 1.25e-6
+  lr_relu3_offset: !!float 1.25e-7
+  lr_feature_extractor: !!float 1e-6
+  freeze_feature_extractor: false
   weight_decay_g: 0
   beta_g: [0.9, 0.999]
   lr_d: !!float 1e-4
   weight_decay_d: 0
   beta_d: [0.9, 0.999]
   lr_scheme: MultiStepLR
-  niter: 40000
+  niter: 10000
   warmup_iter: -1
   net_g_pretrain_steps: 0
-  lr_steps: [20000, 32000, 38000]
+  lr_steps: [6000, 8500, 9500]
   lr_gamma: 0.5
   pixel_criterion: L1Loss
   pixel_weight: !!float 1.0
@@ -143,14 +151,18 @@ train:
       'relu4_1': 1.0
     vgg_type: vgg19
     use_input_norm: true
-    perceptual_weight: !!float 1e-4
+    perceptual_weight: !!float 5e-4
     style_weight: 0
     norm_img: false
     criterion: l1
   edge_opt:
     type: EdgeLoss
-    loss_weight: !!float 5e-2
+    loss_weight: !!float 1e-1
     criterion: l1
+  # Restore differentiable geometry supervision so net_extractor is optimized
+  # and saved as net_extractor_*.pth together with net_g.
+  matching_loss_weight: !!float 1e-3
+  projection_loss_weight: !!float 1e-2
   manual_seed: 10
   net_d_steps: 1
   net_d_init_steps: 0

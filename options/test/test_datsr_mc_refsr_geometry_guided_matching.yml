@@ -1,4 +1,4 @@
-name: test_datsr_mc_refsr_geometry_guided_matching
+name: test_datsr_mc_geometry_soft_valid_percep_edge_extractor_10k
 suffix: ~
 scale: 4
 model_type: RefRestorationModel
@@ -8,7 +8,7 @@ gpu_ids: [0]
 
 datasets:
   test:
-    name: MCRefSR_geometry_guided_matching_test
+    name: MCRefSR_geometry_soft_valid_percep_edge_extractor_10k_test
     type: MCRefSRDataset
     dataroot_in: datasets/test/input
     dataroot_gt: datasets/test/gt
@@ -19,7 +19,7 @@ datasets:
     ref_mode: normal
     use_geometry_ref_crop: false
     use_matching_geo_prior: true
-    matching_geo_mode: projective_window
+    matching_geo_mode: projective_soft_prior
     geometry_depth_type: ray_distance
     geometry_use_ref_depth_consistency: false
     geometry_depth_consistency_rel_tol: 0.05
@@ -59,19 +59,24 @@ network_map:
   vgg_layer_list: ['relu1_1', 'relu2_1', 'relu3_1']
   vgg_type: vgg19
   use_matching_geo_prior: true
-  matching_geo_mode: projective_window
-  geometry_search_radius: 4
-  geometry_position_weight: 0.05
-  geometry_position_sigma: 2.0
+  matching_geo_mode: projective_soft_prior
+  geometry_soft_prior_strength: 1.0
+  geometry_soft_prior_sigma: 0.1
+  geometry_confidence_mode: valid_mask
+  geometry_depth_edge_scale: 0.5
+  geometry_depth_edge_floor: 0.1
+  geometry_auxiliary_logit_scale: 10.0
+  geometry_auxiliary_max_queries: 512
   normalize_similarity: false
 
 network_extractor:
   type: ContrasExtractorSep
 
 path:
-  pretrain_model_g: experiments/train/train_datsr_mc_refsr_geometry_guided_matching/models/net_g_40000.pth
+  # Test the paired generator/extractor produced by the 10k run.
+  pretrain_model_g: experiments/train/finetune_datsr_mc_geometry_soft_valid_percep_edge_extractor_10k_from_baseline/models/net_g_10000.pth
   pretrain_model_d: ~
-  pretrain_model_feature_extractor: experiments/pretrained_model/feature_extraction.pth
+  pretrain_model_feature_extractor: experiments/train/finetune_datsr_mc_geometry_soft_valid_percep_edge_extractor_10k_from_baseline/models/net_extractor_10000.pth
   pretrain_model_wavelet: ~
   strict_load: true
   root: experiments/test/

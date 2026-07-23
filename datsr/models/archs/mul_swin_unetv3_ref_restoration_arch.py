@@ -66,10 +66,13 @@ class AuxResidualBlock(nn.Module):
 
 
 class AuxiliaryEncoder(nn.Module):
-    """Encode same-view HR albedo into DATSR multi-scale feature maps."""
+    """Encode a same-view HR auxiliary buffer into multi-scale features."""
 
-    def __init__(self, in_channels=3, feat_channels=64):
+    def __init__(self, in_channels=3, feat_channels=64, edge_mode='rgb'):
         super(AuxiliaryEncoder, self).__init__()
+        if edge_mode not in ['rgb', 'normal']:
+            raise ValueError(f'Unsupported auxiliary edge mode: {edge_mode}.')
+        self.edge_mode = edge_mode
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, feat_channels, 3, 1, 1),
             nn.LeakyReLU(0.1, True),
@@ -100,10 +103,22 @@ class AuxiliaryEncoder(nn.Module):
         return (x[:, :3, :, :] * weight).sum(dim=1, keepdim=True)
 
     def _edge_pyramid(self, x):
-        y = self._rgb_to_y(x)
-        grad_x = F.conv2d(y, self.sobel_x, padding=1)
-        grad_y = F.conv2d(y, self.sobel_y, padding=1)
-        edge_160 = torch.sqrt(grad_x * grad_x + grad_y * grad_y + 1e-12)
+        if self.edge_mode == 'normal':
+            grad_x = F.conv2d(
+                x, self.sobel_x.expand(x.size(1), 1, 3, 3),
+                padding=1, groups=x.size(1))
+            grad_y = F.conv2d(
+                x, self.sobel_y.expand(x.size(1), 1, 3, 3),
+                padding=1, groups=x.size(1))
+            edge_160 = torch.sqrt(
+                (grad_x * grad_x + grad_y * grad_y).sum(
+                    dim=1, keepdim=True) + 1e-12).clamp_(0, 1)
+        else:
+            y = self._rgb_to_y(x)
+            grad_x = F.conv2d(y, self.sobel_x, padding=1)
+            grad_y = F.conv2d(y, self.sobel_y, padding=1)
+            edge_160 = torch.sqrt(
+                grad_x * grad_x + grad_y * grad_y + 1e-12)
         edge_80 = F.interpolate(
             edge_160, scale_factor=0.5, mode='bilinear',
             align_corners=False)
@@ -112,14 +127,100 @@ class AuxiliaryEncoder(nn.Module):
             align_corners=False)
         return {'160': edge_160, '80': edge_80, '40': edge_40}
 
+    @staticmethod
+    def _decode_normal(x):
+        """Decode RGB normals from [0, 1] and restore unit-vector geometry."""
+        encoded_valid = x[:, :3].abs().sum(dim=1, keepdim=True) > 1e-6
+        normal = x[:, :3] * 2.0 - 1.0
+        vector_valid = normal.square().sum(dim=1, keepdim=True) > 1e-8
+        normal = F.normalize(normal, p=2, dim=1, eps=1e-6)
+        return normal * (encoded_valid & vector_valid).to(normal.dtype)
+
     def forward(self, x):
-        feat_160 = self.stem(x)
+        normal_valid = None
+        if self.edge_mode == 'normal':
+            encoded_valid = x[:, :3].abs().sum(
+                dim=1, keepdim=True) > 1e-6
+            vector_valid = ((x[:, :3] * 2.0 - 1.0).square().sum(
+                dim=1, keepdim=True) > 1e-8)
+            normal_valid = (encoded_valid & vector_valid).to(x.dtype)
+            encoder_input = self._decode_normal(x)
+        else:
+            encoder_input = x
+        feat_160 = self.stem(encoder_input)
+        if normal_valid is not None:
+            feat_160 = feat_160 * normal_valid
         feat_80 = self.down_80(feat_160)
+        if normal_valid is not None:
+            valid_80 = F.interpolate(normal_valid, size=feat_80.shape[-2:],
+                                     mode='nearest')
+            feat_80 = feat_80 * valid_80
         feat_40 = self.down_40(feat_80)
+        if normal_valid is not None:
+            valid_40 = F.interpolate(normal_valid, size=feat_40.shape[-2:],
+                                     mode='nearest')
+            feat_40 = feat_40 * valid_40
+        edge_pyramid = self._edge_pyramid(encoder_input)
+        if normal_valid is not None:
+            edge_pyramid['160'] = edge_pyramid['160'] * normal_valid
+            edge_pyramid['80'] = edge_pyramid['80'] * valid_80
+            edge_pyramid['40'] = edge_pyramid['40'] * valid_40
         return {
             'feat': {'160': feat_160, '80': feat_80, '40': feat_40},
-            'edge': self._edge_pyramid(x)
+            'edge': edge_pyramid
         }
+
+
+class AuxiliaryFeatureBlend(nn.Module):
+    """Blend normal structure into a pretrained albedo feature stream."""
+
+    def __init__(self, channels, init_normal_scale=0.01):
+        super(AuxiliaryFeatureBlend, self).__init__()
+        hidden_channels = max(channels // 4, 16)
+        self.normal_proj = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, 1, 1, bias=False),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(channels, channels, 3, 1, 1, bias=False))
+        self.normal_gate = nn.Sequential(
+            nn.Conv2d(channels * 2 + 2, hidden_channels, 3, 1, 1),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(hidden_channels, 1, 3, 1, 1),
+            nn.Sigmoid())
+        init_normal_scale = min(max(float(init_normal_scale), 1e-4), 1 - 1e-4)
+        self.normal_scale_logit = nn.Parameter(torch.tensor(
+            math.log(init_normal_scale / (1.0 - init_normal_scale)),
+            dtype=torch.float32))
+
+    def forward(self, albedo_feat, albedo_edge, normal_feat, normal_edge):
+        gate = self.normal_gate(torch.cat(
+            [albedo_feat, normal_feat, albedo_edge, normal_edge], dim=1))
+        normal_scale = torch.sigmoid(self.normal_scale_logit)
+        fused_feat = (albedo_feat + normal_scale * gate
+                      * self.normal_proj(normal_feat))
+        fused_edge = torch.clamp(
+            albedo_edge + normal_scale * normal_edge, 0, 1)
+        return fused_feat, fused_edge
+
+
+class AuxiliaryFrontendFusion(nn.Module):
+    """Fuse albedo and normal before the unchanged cross-attention blocks."""
+
+    def __init__(self, channels, init_normal_scale=0.01):
+        super(AuxiliaryFrontendFusion, self).__init__()
+        self.blends = nn.ModuleDict({
+            scale: AuxiliaryFeatureBlend(channels, init_normal_scale)
+            for scale in ['160', '80', '40']
+        })
+
+    def forward(self, albedo_feats, normal_feats):
+        fused = {'feat': {}, 'edge': {}}
+        for scale, blend in self.blends.items():
+            fused_feat, fused_edge = blend(
+                albedo_feats['feat'][scale], albedo_feats['edge'][scale],
+                normal_feats['feat'][scale], normal_feats['edge'][scale])
+            fused['feat'][scale] = fused_feat
+            fused['edge'][scale] = fused_edge
+        return fused
 
 
 class AuxCrossModalityFusion(nn.Module):
@@ -939,12 +1040,25 @@ class NewSwinUnetv3RestorationNet(nn.Module):
                  use_similarity_gate=False, zero_init_ref_hf=True,
                  init_ref_hf_scale=1.0, max_ref_hf_scale=None,
                  use_aux_albedo=False, aux_in_channels=3,
+                 use_aux_normal=False, normal_in_channels=3,
+                 normal_frontend_init_scale=0.01,
                  aux_init_scale=0.01, aux_num_heads=4):
         super(NewSwinUnetv3RestorationNet, self).__init__()
         self.use_aux_albedo = use_aux_albedo
+        self.use_aux_normal = use_aux_normal
+        self.use_auxiliary = use_aux_albedo or use_aux_normal
         if self.use_aux_albedo:
             self.aux_encoder = AuxiliaryEncoder(
-                in_channels=aux_in_channels, feat_channels=ngf)
+                in_channels=aux_in_channels, feat_channels=ngf,
+                edge_mode='rgb')
+        if self.use_aux_normal:
+            self.normal_encoder = AuxiliaryEncoder(
+                in_channels=normal_in_channels, feat_channels=ngf,
+                edge_mode='normal')
+        if self.use_aux_albedo and self.use_aux_normal:
+            self.aux_frontend_fusion = AuxiliaryFrontendFusion(
+                channels=ngf,
+                init_normal_scale=normal_frontend_init_scale)
         self.content_extractor = ContentExtractor(
             in_nc=3, out_nc=3, nf=ngf, n_blocks=n_blocks)
         self.dyn_agg_restore = DynamicAggregationRestoration(
@@ -958,7 +1072,7 @@ class NewSwinUnetv3RestorationNet(nn.Module):
             zero_init_ref_hf=zero_init_ref_hf,
             init_ref_hf_scale=init_ref_hf_scale,
             max_ref_hf_scale=max_ref_hf_scale,
-            use_aux_albedo=use_aux_albedo,
+            use_aux_albedo=self.use_auxiliary,
             aux_init_scale=aux_init_scale,
             aux_num_heads=aux_num_heads,
             aux_window_size=window_size)
@@ -980,7 +1094,7 @@ class NewSwinUnetv3RestorationNet(nn.Module):
         self.dyn_agg_restore.up_large_dyn_agg.conv_offset_mask.bias.data.zero_()
 
     def forward(self, x, pre_offset_flow_sim, img_ref_feat, F_wav=None,
-                img_albedo=None):
+                img_albedo=None, img_normal=None):
         """
                 Args:
                     x (Tensor): img_in_lq, (B, 3, 40, 40)
@@ -994,8 +1108,25 @@ class NewSwinUnetv3RestorationNet(nn.Module):
         base = F.interpolate(x, None, 4, 'bilinear', False)
         content_feat = self.content_extractor(x)
         aux_feats = None
-        if self.use_aux_albedo and img_albedo is not None:
-            aux_feats = self.aux_encoder(img_albedo)
+        albedo_feats = None
+        normal_feats = None
+        if self.use_aux_albedo:
+            if img_albedo is None:
+                raise ValueError(
+                    'use_aux_albedo=True requires img_albedo in the batch.')
+            albedo_feats = self.aux_encoder(img_albedo)
+        if self.use_aux_normal:
+            if img_normal is None:
+                raise ValueError(
+                    'use_aux_normal=True requires img_normal in the batch.')
+            normal_feats = self.normal_encoder(img_normal)
+        if albedo_feats is not None and normal_feats is not None:
+            aux_feats = self.aux_frontend_fusion(
+                albedo_feats, normal_feats)
+        elif albedo_feats is not None:
+            aux_feats = albedo_feats
+        elif normal_feats is not None:
+            aux_feats = normal_feats
         upscale_restore = self.dyn_agg_restore(
             base, content_feat, pre_offset_flow_sim, img_ref_feat, F_wav,
             aux_feats)

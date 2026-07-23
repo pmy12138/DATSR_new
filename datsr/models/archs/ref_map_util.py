@@ -231,6 +231,204 @@ def geometry_guided_feature_match_index(
     return max_idx.view(query_h, query_w), max_val.view(query_h, query_w)
 
 
+def probabilistic_geometry_feature_match_index(
+        feat_input,
+        feat_ref,
+        projected_ref_coords,
+        geometry_valid_mask,
+        geometry_confidence=None,
+        patch_size=3,
+        input_stride=1,
+        ref_stride=1,
+        is_norm=True,
+        norm_input=False,
+        prior_strength=1.0,
+        prior_sigma=0.1,
+        compute_auxiliary=False,
+        auxiliary_logit_scale=10.0,
+        auxiliary_max_queries=512):
+    """Globally match patches with a soft projective spatial prior.
+
+    Every Ref patch remains a candidate.  For a valid projected query, the
+    normalized squared distance to the camera/depth-predicted coordinate is
+    subtracted from the appearance score.  Invalid projections use pure
+    appearance matching.  During training, an optional differentiable
+    distribution provides matching and projection-coordinate losses without
+    changing the hard MAP correspondence consumed by DATSR.
+    """
+    if projected_ref_coords is None or geometry_valid_mask is None:
+        raise ValueError(
+            'Projective soft-prior matching requires Ref coordinates and a '
+            'valid mask.')
+    if prior_strength < 0:
+        raise ValueError('prior_strength must be non-negative.')
+    if prior_sigma <= 0:
+        raise ValueError('prior_sigma must be positive.')
+    if auxiliary_logit_scale <= 0:
+        raise ValueError('auxiliary_logit_scale must be positive.')
+    if auxiliary_max_queries < 1:
+        raise ValueError('auxiliary_max_queries must be at least 1.')
+
+    _, input_h, input_w = feat_input.shape
+    _, ref_h, ref_w = feat_ref.shape
+    query_h = int((input_h - patch_size) / input_stride + 1)
+    query_w = int((input_w - patch_size) / input_stride + 1)
+    ref_grid_h = int((ref_h - patch_size) / ref_stride + 1)
+    ref_grid_w = int((ref_w - patch_size) / ref_stride + 1)
+
+    coords = projected_ref_coords
+    if coords.dim() == 3:
+        coords = coords.unsqueeze(0)
+    mask = geometry_valid_mask
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0).unsqueeze(0)
+    elif mask.dim() == 3:
+        mask = mask.unsqueeze(0)
+    if coords.shape[1] != 2 or mask.shape[1] != 1:
+        raise ValueError(
+            'Projected Ref coordinates/mask must have 2 and 1 channels.')
+    coords = F.interpolate(
+        coords.float(), size=(query_h, query_w), mode='nearest').squeeze(0)
+    mask = F.interpolate(
+        mask.float(), size=(query_h, query_w), mode='nearest'
+    ).squeeze(0).squeeze(0).clamp(0.0, 1.0)
+
+    if geometry_confidence is None:
+        confidence = torch.ones_like(mask)
+    else:
+        confidence = geometry_confidence
+        if confidence.dim() == 2:
+            confidence = confidence.unsqueeze(0).unsqueeze(0)
+        elif confidence.dim() == 3:
+            confidence = confidence.unsqueeze(0)
+        if confidence.shape[1] != 1:
+            raise ValueError('Geometry confidence must have one channel.')
+        confidence = F.interpolate(
+            confidence.float(), size=(query_h, query_w), mode='nearest'
+        ).squeeze(0).squeeze(0).clamp(0.0, 1.0)
+    confidence = (confidence * mask).reshape(-1)
+
+    patch_center = (patch_size - 1) * 0.5
+    pred_x_feat = coords[0] * max(ref_w - 1, 1)
+    pred_y_feat = coords[1] * max(ref_h - 1, 1)
+    pred_x = ((pred_x_feat - patch_center) / ref_stride).clamp(
+        0, max(ref_grid_w - 1, 0)).reshape(-1)
+    pred_y = ((pred_y_feat - patch_center) / ref_stride).clamp(
+        0, max(ref_grid_h - 1, 0)).reshape(-1)
+    pred_x_norm = pred_x / max(ref_grid_w - 1, 1)
+    pred_y_norm = pred_y / max(ref_grid_h - 1, 1)
+
+    query_patches = F.unfold(
+        feat_input.unsqueeze(0), kernel_size=patch_size,
+        stride=input_stride).squeeze(0)
+    ref_patches = F.unfold(
+        feat_ref.unsqueeze(0), kernel_size=patch_size,
+        stride=ref_stride).squeeze(0)
+    if norm_input:
+        query_patches = F.normalize(query_patches, p=2, dim=0, eps=1e-5)
+    if is_norm:
+        ref_patches = F.normalize(ref_patches, p=2, dim=0, eps=1e-5)
+
+    n_queries = query_patches.shape[1]
+    n_ref_patches = ref_patches.shape[1]
+    ref_indices = torch.arange(n_ref_patches, device=feat_input.device)
+    ref_x_norm = (ref_indices % ref_grid_w).to(feat_input.dtype) / max(
+        ref_grid_w - 1, 1)
+    ref_y_norm = torch.div(
+        ref_indices, ref_grid_w, rounding_mode='floor'
+    ).to(feat_input.dtype) / max(ref_grid_h - 1, 1)
+
+    # Bound the temporary [query, Ref-candidate] score tensor to about 64 MiB
+    # in fp32.  This keeps full-image validation possible without constructing
+    # the complete quadratic score matrix at once.
+    candidate_chunk = max(
+        1, int(16 * 1024**2 / max(n_queries, 1)))
+    best_score = torch.full(
+        (n_queries,), torch.finfo(feat_input.dtype).min,
+        dtype=feat_input.dtype, device=feat_input.device)
+    best_appearance = torch.zeros_like(best_score)
+    best_index = torch.zeros(
+        n_queries, dtype=torch.long, device=feat_input.device)
+    query_matrix = query_patches.transpose(0, 1)
+    confidence_column = confidence[:, None]
+    auxiliary_query_indices = torch.empty(
+        0, dtype=torch.long, device=feat_input.device)
+    auxiliary_appearance_chunks = []
+    auxiliary_distance_chunks = []
+    if compute_auxiliary:
+        auxiliary_query_indices = torch.nonzero(
+            confidence > 0, as_tuple=False).squeeze(1)
+        if auxiliary_query_indices.numel() > auxiliary_max_queries:
+            sample_step = (
+                auxiliary_query_indices.numel() + auxiliary_max_queries - 1
+            ) // auxiliary_max_queries
+            auxiliary_query_indices = auxiliary_query_indices[
+                ::sample_step][:auxiliary_max_queries]
+    for start in range(0, n_ref_patches, candidate_chunk):
+        end = min(start + candidate_chunk, n_ref_patches)
+        appearance = query_matrix @ ref_patches[:, start:end]
+        distance2 = (
+            pred_x_norm[:, None] - ref_x_norm[None, start:end]).square()
+        distance2 = distance2 + (
+            pred_y_norm[:, None] - ref_y_norm[None, start:end]).square()
+        if auxiliary_query_indices.numel() > 0:
+            auxiliary_appearance_chunks.append(
+                appearance[auxiliary_query_indices])
+            auxiliary_distance_chunks.append(
+                distance2[auxiliary_query_indices])
+        score = appearance - (
+            prior_strength * confidence_column * distance2 / prior_sigma)
+        chunk_score, chunk_choice = score.max(dim=1)
+        chunk_appearance = appearance.gather(
+            1, chunk_choice[:, None]).squeeze(1)
+        replace = chunk_score > best_score
+        best_score = torch.where(replace, chunk_score, best_score)
+        best_appearance = torch.where(
+            replace, chunk_appearance, best_appearance)
+        best_index = torch.where(
+            replace, chunk_choice + start, best_index)
+
+    zero = query_patches.sum() * 0.0
+    auxiliary = {
+        'matching': zero,
+        'projection': zero,
+        'valid_ratio': mask.mean().detach(),
+        'confidence_mean': confidence.mean().detach(),
+    }
+    if auxiliary_query_indices.numel() > 0:
+        aux_appearance = torch.cat(
+            auxiliary_appearance_chunks, dim=1)
+        aux_distance2 = torch.cat(auxiliary_distance_chunks, dim=1)
+        aux_confidence = confidence[auxiliary_query_indices]
+        aux_logits = auxiliary_logit_scale * (
+            aux_appearance - prior_strength * aux_confidence[:, None]
+            * aux_distance2 / prior_sigma)
+        target_x = pred_x[auxiliary_query_indices].round().long().clamp(
+            0, ref_grid_w - 1)
+        target_y = pred_y[auxiliary_query_indices].round().long().clamp(
+            0, ref_grid_h - 1)
+        target_index = target_y * ref_grid_w + target_x
+        matching_per_query = F.cross_entropy(
+            aux_logits, target_index, reduction='none')
+        normalizer = aux_confidence.sum().clamp_min(1e-6)
+        auxiliary['matching'] = (
+            matching_per_query * aux_confidence).sum() / normalizer
+
+        probability = F.softmax(aux_logits, dim=1)
+        expected_x = probability @ ref_x_norm
+        expected_y = probability @ ref_y_norm
+        projection_per_query = F.smooth_l1_loss(
+            torch.stack((expected_x, expected_y), dim=1),
+            torch.stack((pred_x_norm[auxiliary_query_indices],
+                         pred_y_norm[auxiliary_query_indices]), dim=1),
+            reduction='none').sum(dim=1)
+        auxiliary['projection'] = (
+            projection_per_query * aux_confidence).sum() / normalizer
+
+    return (best_index.view(query_h, query_w),
+            best_appearance.view(query_h, query_w), auxiliary)
+
+
 def topk_feature_match_index(feat_input,
                              feat_ref,
                              patch_size=3,

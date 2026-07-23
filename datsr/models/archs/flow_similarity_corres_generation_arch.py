@@ -6,7 +6,8 @@ import torch.nn.functional as F
 
 from datsr.models.archs.arch_util import tensor_shift
 from datsr.models.archs.ref_map_util import (feature_match_index,
-                                              geometry_guided_feature_match_index)
+                                              geometry_guided_feature_match_index,
+                                              probabilistic_geometry_feature_match_index)
 from datsr.models.archs.vgg_arch import VGGFeatureExtractor
 
 logger = logging.getLogger('base')
@@ -29,7 +30,14 @@ class FlowSimCorrespondenceGenerationArch(nn.Module):
                  geometry_prior_blur_kernel=5,
                  geometry_search_radius=4,
                  geometry_position_weight=0.0,
-                 geometry_position_sigma=2.0):
+                 geometry_position_sigma=2.0,
+                 geometry_soft_prior_strength=1.0,
+                 geometry_soft_prior_sigma=0.1,
+                 geometry_confidence_mode='valid_mask',
+                 geometry_depth_edge_scale=0.5,
+                 geometry_depth_edge_floor=0.1,
+                 geometry_auxiliary_logit_scale=10.0,
+                 geometry_auxiliary_max_queries=512):
         super(FlowSimCorrespondenceGenerationArch, self).__init__()
         self.patch_size = patch_size
         self.stride = stride
@@ -44,11 +52,24 @@ class FlowSimCorrespondenceGenerationArch(nn.Module):
         self.geometry_search_radius = int(geometry_search_radius)
         self.geometry_position_weight = float(geometry_position_weight)
         self.geometry_position_sigma = float(geometry_position_sigma)
+        self.geometry_soft_prior_strength = float(
+            geometry_soft_prior_strength)
+        self.geometry_soft_prior_sigma = float(geometry_soft_prior_sigma)
+        self.geometry_confidence_mode = geometry_confidence_mode
+        self.geometry_depth_edge_scale = float(geometry_depth_edge_scale)
+        self.geometry_depth_edge_floor = float(geometry_depth_edge_floor)
+        self.geometry_auxiliary_logit_scale = float(
+            geometry_auxiliary_logit_scale)
+        self.geometry_auxiliary_max_queries = int(
+            geometry_auxiliary_max_queries)
+        self.matching_aux_losses = {}
 
         if (self.use_matching_geo_prior
-                and self.matching_geo_mode not in ['depth', 'projective_window']):
+                and self.matching_geo_mode not in [
+                    'depth', 'projective_window', 'projective_soft_prior']):
             raise ValueError(
-                'matching_geo_mode must be depth or projective_window.')
+                'matching_geo_mode must be depth, projective_window, or '
+                'projective_soft_prior.')
         if not 0.0 <= self.geometry_prior_strength <= 1.0:
             raise ValueError('geometry_prior_strength must be in [0, 1].')
         if not 0.0 <= self.geometry_prior_floor <= 1.0:
@@ -63,6 +84,24 @@ class FlowSimCorrespondenceGenerationArch(nn.Module):
             raise ValueError('geometry_position_weight must be non-negative.')
         if self.geometry_position_sigma <= 0:
             raise ValueError('geometry_position_sigma must be positive.')
+        if self.geometry_soft_prior_strength < 0:
+            raise ValueError(
+                'geometry_soft_prior_strength must be non-negative.')
+        if self.geometry_soft_prior_sigma <= 0:
+            raise ValueError('geometry_soft_prior_sigma must be positive.')
+        if self.geometry_confidence_mode not in ['valid_mask', 'depth_edge']:
+            raise ValueError(
+                'geometry_confidence_mode must be valid_mask or depth_edge.')
+        if self.geometry_depth_edge_scale < 0:
+            raise ValueError('geometry_depth_edge_scale must be non-negative.')
+        if not 0 <= self.geometry_depth_edge_floor <= 1:
+            raise ValueError('geometry_depth_edge_floor must be in [0, 1].')
+        if self.geometry_auxiliary_logit_scale <= 0:
+            raise ValueError(
+                'geometry_auxiliary_logit_scale must be positive.')
+        if self.geometry_auxiliary_max_queries < 1:
+            raise ValueError(
+                'geometry_auxiliary_max_queries must be at least 1.')
 
         self.vgg_layer_list = vgg_layer_list
         self.vgg = VGGFeatureExtractor(
@@ -151,10 +190,41 @@ class FlowSimCorrespondenceGenerationArch(nn.Module):
                 padding=padding)
         return confidence.clamp_(0.0, 1.0)
 
+    def _build_depth_edge_confidence(self, depth_guidance, target_size):
+        """Down-weight projective priors at noisy depth discontinuities."""
+        if depth_guidance is None:
+            raise ValueError(
+                'depth_edge confidence requires target metric depth.')
+        if depth_guidance.dim() == 3:
+            depth_guidance = depth_guidance.unsqueeze(1)
+        if depth_guidance.shape[1] != 1:
+            raise ValueError('Metric depth must have exactly one channel.')
+        depth = depth_guidance.float()
+        if depth.shape[-2:] != target_size:
+            depth = F.interpolate(
+                depth, size=target_size, mode='nearest')
+        valid = torch.isfinite(depth) & (depth > 0)
+        safe_depth = torch.where(valid, depth, torch.ones_like(depth))
+        log_depth = torch.log(safe_depth.clamp_min(1e-6))
+        grad_x = F.conv2d(log_depth, self.sobel_x, padding=1)
+        grad_y = F.conv2d(log_depth, self.sobel_y, padding=1)
+        grad_mag = torch.sqrt(grad_x.square() + grad_y.square() + 1e-12)
+        valid_float = valid.float()
+        grad_scale = (
+            (grad_mag * valid_float).sum(dim=(2, 3), keepdim=True)
+            / valid_float.sum(dim=(2, 3), keepdim=True).clamp_min(1.0))
+        normalized_grad = grad_mag / (grad_scale + 1e-6)
+        confidence = torch.exp(
+            -self.geometry_depth_edge_scale * normalized_grad)
+        confidence = (self.geometry_depth_edge_floor
+                      + (1.0 - self.geometry_depth_edge_floor) * confidence)
+        return confidence.clamp(0.0, 1.0) * valid_float
+
     def _apply_similarity_guidance(self, sim_map, depth_guidance):
         sim_out = torch.sigmoid(sim_map) if self.normalize_similarity else sim_map
         if (not self.use_matching_geo_prior
-                or self.matching_geo_mode == 'projective_window'):
+                or self.matching_geo_mode in [
+                    'projective_window', 'projective_soft_prior']):
             return sim_out
         if depth_guidance is None:
             raise ValueError(
@@ -168,7 +238,8 @@ class FlowSimCorrespondenceGenerationArch(nn.Module):
                 self.geometry_prior_strength * guided)
 
     def forward(self, dense_features, img_ref_hr, depth_guidance=None,
-                projected_ref_coords=None, geometry_valid_mask=None):
+                projected_ref_coords=None, geometry_valid_mask=None,
+                compute_matching_auxiliary=False):
         batch_offset_relu3 = []
         batch_offset_relu2 = []
         batch_offset_relu1 = []
@@ -178,6 +249,10 @@ class FlowSimCorrespondenceGenerationArch(nn.Module):
         similarity_relu3 = []
         similarity_relu2 = []
         similarity_relu1 = []
+        auxiliary_matching = []
+        auxiliary_projection = []
+        auxiliary_valid_ratio = []
+        auxiliary_confidence_mean = []
 
         for ind in range(img_ref_hr.size(0)):
             feat_in = dense_features['dense_features1'][ind]
@@ -205,6 +280,46 @@ class FlowSimCorrespondenceGenerationArch(nn.Module):
                     search_radius=self.geometry_search_radius,
                     position_weight=self.geometry_position_weight,
                     position_sigma=self.geometry_position_sigma)
+            elif (self.use_matching_geo_prior
+                  and self.matching_geo_mode == 'projective_soft_prior'):
+                if projected_ref_coords is None or geometry_valid_mask is None:
+                    raise ValueError(
+                        'projective_soft_prior matching requires geometry '
+                        'tensors.')
+                geometry_confidence = None
+                if self.geometry_confidence_mode == 'depth_edge':
+                    if depth_guidance is None:
+                        raise ValueError(
+                            'depth_edge confidence requires depth guidance.')
+                    geometry_confidence = self._build_depth_edge_confidence(
+                        depth_guidance[ind:ind + 1],
+                        projected_ref_coords[ind].shape[-2:])
+                _max_idx, _max_val, auxiliary = \
+                    probabilistic_geometry_feature_match_index(
+                        feat_in,
+                        feat_ref,
+                        projected_ref_coords[ind],
+                        geometry_valid_mask[ind],
+                        geometry_confidence=(
+                            geometry_confidence[0]
+                            if geometry_confidence is not None else None),
+                        patch_size=self.patch_size,
+                        input_stride=self.stride,
+                        ref_stride=self.stride,
+                        is_norm=True,
+                        norm_input=True,
+                        prior_strength=self.geometry_soft_prior_strength,
+                        prior_sigma=self.geometry_soft_prior_sigma,
+                        compute_auxiliary=compute_matching_auxiliary,
+                        auxiliary_logit_scale=(
+                            self.geometry_auxiliary_logit_scale),
+                        auxiliary_max_queries=(
+                            self.geometry_auxiliary_max_queries))
+                auxiliary_matching.append(auxiliary['matching'])
+                auxiliary_projection.append(auxiliary['projection'])
+                auxiliary_valid_ratio.append(auxiliary['valid_ratio'])
+                auxiliary_confidence_mean.append(
+                    auxiliary['confidence_mean'])
             else:
                 _max_idx, _max_val = feature_match_index(
                     feat_in,
@@ -300,4 +415,17 @@ class FlowSimCorrespondenceGenerationArch(nn.Module):
 
         img_ref_feat = self.vgg(img_ref_hr)
 
+        self.matching_aux_losses = {}
+        if auxiliary_matching:
+            self.matching_aux_losses = {
+                'matching': torch.stack(auxiliary_matching).mean(),
+                'projection': torch.stack(auxiliary_projection).mean(),
+                'valid_ratio': torch.stack(auxiliary_valid_ratio).mean(),
+                'confidence_mean': torch.stack(
+                    auxiliary_confidence_mean).mean(),
+            }
+
         return [pre_offset, pre_flow, pre_similarity], img_ref_feat
+
+    def get_matching_aux_losses(self):
+        return self.matching_aux_losses
