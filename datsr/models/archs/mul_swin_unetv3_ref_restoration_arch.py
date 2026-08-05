@@ -1462,6 +1462,10 @@ class DynamicAggregationRestoration(nn.Module):
         pre_offset = pre_offset_flow_sim[0]  # [B, K, 9, H*s, W*s, 2]
         pre_flow = pre_offset_flow_sim[1]  # [B, H*s, W*s, 2]
         pre_similarity = pre_offset_flow_sim[2]  # [B, K, 1, H*s, W*s]
+        geometry_radius = (pre_offset_flow_sim[3]
+                           if len(pre_offset_flow_sim) > 3 else {})
+        geometry_confidence = (pre_offset_flow_sim[4]
+                               if len(pre_offset_flow_sim) > 4 else {})
 
         # Warp reference features with precomputed flow.
 
@@ -1497,7 +1501,9 @@ class DynamicAggregationRestoration(nn.Module):
                 self.down_large_dyn_agg(
                     [img_ref_feat['relu1_1'], down_relu1_offset],
                     pre_offset['relu1_1'][:, k, :, :, :],
-                    pre_similarity['relu1_1'][:, k, :, :, :])))  # [B, 64, 160, 160]
+                    pre_similarity['relu1_1'][:, k, :, :, :],
+                    geometry_radius.get('relu1_1'),
+                    geometry_confidence.get('relu1_1'))))  # [B, 64, 160, 160]
 
         down_relu1_weight = self.softmax(pre_similarity['relu1_1'])
         down_relu1_swapped_feat = (torch.stack(down_relu1_swapped_feat, dim=1) * down_relu1_weight).sum(
@@ -1523,7 +1529,9 @@ class DynamicAggregationRestoration(nn.Module):
                 self.down_medium_dyn_agg(
                     [img_ref_feat['relu2_1'], down_relu2_offset],
                     pre_offset['relu2_1'][:, k, :, :, :],
-                    pre_similarity['relu2_1'][:, k, :, :, :])))  # [B, 128, 80, 80]
+                    pre_similarity['relu2_1'][:, k, :, :, :],
+                    geometry_radius.get('relu2_1'),
+                    geometry_confidence.get('relu2_1'))))  # [B, 128, 80, 80]
 
         down_relu2_weight = self.softmax(pre_similarity['relu2_1'])
         down_relu2_swapped_feat = (torch.stack(down_relu2_swapped_feat, dim=1) * down_relu2_weight).sum(
@@ -1574,7 +1582,9 @@ class DynamicAggregationRestoration(nn.Module):
                 self.up_small_dyn_agg(
                     [img_ref_feat['relu3_1'], relu3_offset],
                     pre_offset['relu3_1'][:, k, :, :, :],
-                    pre_similarity['relu3_1'][:, k, :, :, :])))  # [B, 256, 40, 40]
+                    pre_similarity['relu3_1'][:, k, :, :, :],
+                    geometry_radius.get('relu3_1'),
+                    geometry_confidence.get('relu3_1'))))  # [B, 256, 40, 40]
 
         relu3_weight = self.softmax(pre_similarity['relu3_1'])
         relu3_swapped_feat = (torch.stack(relu3_swapped_feat, dim=1) * relu3_weight).sum(dim=1)  # [B, 256, 40, 40]
@@ -1600,7 +1610,9 @@ class DynamicAggregationRestoration(nn.Module):
                 self.up_medium_dyn_agg(
                     [img_ref_feat['relu2_1'], relu2_offset],
                     pre_offset['relu2_1'][:, k, :, :, :],
-                    pre_similarity['relu2_1'][:, k, :, :, :])))  # [B, 128, 80, 80]
+                    pre_similarity['relu2_1'][:, k, :, :, :],
+                    geometry_radius.get('relu2_1'),
+                    geometry_confidence.get('relu2_1'))))  # [B, 128, 80, 80]
 
         relu2_weight = self.softmax(pre_similarity['relu2_1'])
         relu2_swapped_feat = (torch.stack(relu2_swapped_feat, dim=1) * relu2_weight).sum(dim=1)  # [B, 128, 80, 80]
@@ -1645,7 +1657,9 @@ class DynamicAggregationRestoration(nn.Module):
                 self.up_large_dyn_agg(
                     [img_ref_feat['relu1_1'], relu1_offset],
                     pre_offset['relu1_1'][:, k, :, :, :],
-                    pre_similarity['relu1_1'][:, k, :, :, :])))  # [B, 64, 160, 160]
+                    pre_similarity['relu1_1'][:, k, :, :, :],
+                    geometry_radius.get('relu1_1'),
+                    geometry_confidence.get('relu1_1'))))  # [B, 64, 160, 160]
 
         relu1_weight = self.softmax(pre_similarity['relu1_1'])
         relu1_swapped_feat = (torch.stack(relu1_swapped_feat, dim=1) * relu1_weight).sum(dim=1)  # [B, 64, 160, 160]

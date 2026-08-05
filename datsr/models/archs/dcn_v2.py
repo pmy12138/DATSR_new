@@ -6,6 +6,7 @@ import math
 #import _ext as _backend
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 from torch.nn.modules.utils import _pair
@@ -507,7 +508,8 @@ class DCN_sep_pre_multi_offset_flow_similarity(DCNv2):
         self.conv_offset_mask.weight.data.zero_()
         self.conv_offset_mask.bias.data.zero_()
 
-    def forward(self, x, pre_offset, pre_sim):
+    def forward(self, x, pre_offset, pre_sim, adaptive_radius=None,
+                geometry_confidence=None):
         '''
         Args:
             pre_offset: precomputed_offset. Size: [b, 9, h, w, 2]
@@ -522,7 +524,21 @@ class DCN_sep_pre_multi_offset_flow_similarity(DCNv2):
 
         o1, o2, mask = torch.chunk(out, 3, dim=1)   # [9, 72, 40, 40]
         offset = torch.cat((o1, o2), dim=1)  # [9, 144, 40, 40]
-        if self.max_residue_magnitude:
+        if adaptive_radius is not None:
+            if adaptive_radius.dim() == 3:
+                adaptive_radius = adaptive_radius.unsqueeze(1)
+            if adaptive_radius.shape[-2:] != offset.shape[-2:]:
+                adaptive_radius = F.interpolate(
+                    adaptive_radius, size=offset.shape[-2:], mode='bilinear',
+                    align_corners=False)
+            if adaptive_radius.shape[0] != offset.shape[0] or \
+                    adaptive_radius.shape[1] != 1:
+                raise ValueError(
+                    'Adaptive DCN radius must have shape [B, 1, H, W].')
+            adaptive_radius = adaptive_radius.to(
+                device=offset.device, dtype=offset.dtype).clamp_min(0.0)
+            offset = adaptive_radius * torch.tanh(offset)
+        elif self.max_residue_magnitude:
             offset = self.max_residue_magnitude * torch.tanh(offset)
         # repeat pre_offset along dim1, shape: [b, 9*groups, h, w, 2]
         pre_offset = pre_offset.repeat([1, self.deformable_groups, 1, 1, 1])  #[9, 72, 40, 40, 2]
@@ -538,6 +554,20 @@ class DCN_sep_pre_multi_offset_flow_similarity(DCNv2):
             mask = torch.sigmoid(mask*pre_sim)
         else:
             mask = torch.sigmoid(mask)  # [9, 72, 40, 40]
+        if geometry_confidence is not None:
+            if geometry_confidence.dim() == 3:
+                geometry_confidence = geometry_confidence.unsqueeze(1)
+            if geometry_confidence.shape[-2:] != mask.shape[-2:]:
+                geometry_confidence = F.interpolate(
+                    geometry_confidence, size=mask.shape[-2:],
+                    mode='bilinear', align_corners=False)
+            if geometry_confidence.shape[0] != mask.shape[0] or \
+                    geometry_confidence.shape[1] != 1:
+                raise ValueError(
+                    'Geometry confidence must have shape [B, 1, H, W].')
+            geometry_confidence = geometry_confidence.to(
+                device=mask.device, dtype=mask.dtype).clamp(0.0, 1.0)
+            mask = mask * geometry_confidence
 
         offset_mean = torch.mean(torch.abs(offset - pre_offset_reorder))
         if offset_mean > 100:

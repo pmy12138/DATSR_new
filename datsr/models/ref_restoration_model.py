@@ -7,6 +7,7 @@ from collections import OrderedDict
 
 import mmcv
 import torch
+import torch.nn.functional as F
 
 import datsr.models.networks as networks
 import datsr.utils.metrics as metrics
@@ -342,6 +343,21 @@ class RefRestorationModel(SRModel):
         # pre_flow_up['relu1_1']: (B, 160, 160, 2)  
 
         pre_offset_flow_sim_up = [pre_offset_up, pre_flow_up, pre_similarity_up]
+        if len(pre_offset_flow_sim) > 3:
+            geometry_radius = {
+                level: F.interpolate(
+                    radius, size=pre_similarity_up[level].shape[-2:],
+                    mode='bilinear', align_corners=False)
+                for level, radius in pre_offset_flow_sim[3].items()
+            }
+            geometry_confidence = {
+                level: F.interpolate(
+                    confidence, size=pre_similarity_up[level].shape[-2:],
+                    mode='bilinear', align_corners=False).clamp(0.0, 1.0)
+                for level, confidence in pre_offset_flow_sim[4].items()
+            }
+            pre_offset_flow_sim_up.extend(
+                [geometry_radius, geometry_confidence])
 
         return pre_offset_flow_sim_up, img_ref_feat, F_wav
 
@@ -402,7 +418,26 @@ class RefRestorationModel(SRModel):
             pre_offset, pre_flow, pre_similarity = upsample_offsets(
                 pre_offset, pre_flow, pre_similarity, scale=2)
 
-        return [pre_offset, pre_flow, pre_similarity], img_ref_feat, F_wav
+        correspondence = [pre_offset, pre_flow, pre_similarity]
+        if len(pre_offset_flow_sim) > 3:
+            geometry_radius = pre_offset_flow_sim[3]
+            geometry_confidence = pre_offset_flow_sim[4]
+            if needs_upsample:
+                geometry_radius = {
+                    level: F.interpolate(
+                        radius, size=pre_similarity[level].shape[-2:],
+                        mode='bilinear', align_corners=False)
+                    for level, radius in geometry_radius.items()
+                }
+                geometry_confidence = {
+                    level: F.interpolate(
+                        confidence, size=pre_similarity[level].shape[-2:],
+                        mode='bilinear', align_corners=False).clamp(0.0, 1.0)
+                    for level, confidence in geometry_confidence.items()
+                }
+            correspondence.extend([geometry_radius, geometry_confidence])
+
+        return correspondence, img_ref_feat, F_wav
 
     def optimize_parameters(self, step):
 

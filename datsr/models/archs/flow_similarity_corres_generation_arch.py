@@ -37,7 +37,14 @@ class FlowSimCorrespondenceGenerationArch(nn.Module):
                  geometry_depth_edge_scale=0.5,
                  geometry_depth_edge_floor=0.1,
                  geometry_auxiliary_logit_scale=10.0,
-                 geometry_auxiliary_max_queries=512):
+                 geometry_auxiliary_max_queries=512,
+                 use_geometry_adaptive_dcn=False,
+                 gar_dcn_base_radius=10.0,
+                 gar_dcn_radius_min=6.0,
+                 gar_dcn_radius_max=14.0,
+                 gar_dcn_extent_min=0.6,
+                 gar_dcn_extent_max=1.4,
+                 gar_dcn_mask_floor=0.25):
         super(FlowSimCorrespondenceGenerationArch, self).__init__()
         self.patch_size = patch_size
         self.stride = stride
@@ -62,6 +69,13 @@ class FlowSimCorrespondenceGenerationArch(nn.Module):
             geometry_auxiliary_logit_scale)
         self.geometry_auxiliary_max_queries = int(
             geometry_auxiliary_max_queries)
+        self.use_geometry_adaptive_dcn = bool(use_geometry_adaptive_dcn)
+        self.gar_dcn_base_radius = float(gar_dcn_base_radius)
+        self.gar_dcn_radius_min = float(gar_dcn_radius_min)
+        self.gar_dcn_radius_max = float(gar_dcn_radius_max)
+        self.gar_dcn_extent_min = float(gar_dcn_extent_min)
+        self.gar_dcn_extent_max = float(gar_dcn_extent_max)
+        self.gar_dcn_mask_floor = float(gar_dcn_mask_floor)
         self.matching_aux_losses = {}
 
         if (self.use_matching_geo_prior
@@ -102,6 +116,16 @@ class FlowSimCorrespondenceGenerationArch(nn.Module):
         if self.geometry_auxiliary_max_queries < 1:
             raise ValueError(
                 'geometry_auxiliary_max_queries must be at least 1.')
+        if self.gar_dcn_base_radius <= 0:
+            raise ValueError('gar_dcn_base_radius must be positive.')
+        if not 0 < self.gar_dcn_radius_min <= self.gar_dcn_radius_max:
+            raise ValueError(
+                'GAR-DCN radius bounds must be positive and ordered.')
+        if not 0 < self.gar_dcn_extent_min <= self.gar_dcn_extent_max:
+            raise ValueError(
+                'GAR-DCN extent bounds must be positive and ordered.')
+        if not 0 <= self.gar_dcn_mask_floor <= 1:
+            raise ValueError('gar_dcn_mask_floor must be in [0, 1].')
 
         self.vgg_layer_list = vgg_layer_list
         self.vgg = VGGFeatureExtractor(
@@ -208,7 +232,7 @@ class FlowSimCorrespondenceGenerationArch(nn.Module):
         log_depth = torch.log(safe_depth.clamp_min(1e-6))
         grad_x = F.conv2d(log_depth, self.sobel_x, padding=1)
         grad_y = F.conv2d(log_depth, self.sobel_y, padding=1)
-        grad_mag = torch.sqrt(grad_x.square() + grad_y.square() + 1e-12)
+        grad_mag = torch.sqrt(grad_x.square() + grad_y.square())
         valid_float = valid.float()
         grad_scale = (
             (grad_mag * valid_float).sum(dim=(2, 3), keepdim=True)
@@ -236,6 +260,93 @@ class FlowSimCorrespondenceGenerationArch(nn.Module):
         guided = sim_out * geo_weight
         return ((1.0 - self.geometry_prior_strength) * sim_out +
                 self.geometry_prior_strength * guided)
+
+    def _build_geometry_adaptive_dcn_guidance(
+            self, projected_ref_coords, geometry_valid_mask, depth_guidance,
+            target_sizes):
+        if projected_ref_coords is None or geometry_valid_mask is None:
+            raise ValueError(
+                'Geometry-adaptive DCN requires projected coordinates and a '
+                'validity mask.')
+
+        coords = projected_ref_coords.float()
+        valid = geometry_valid_mask.float()
+        if coords.dim() == 3:
+            coords = coords.unsqueeze(0)
+        if valid.dim() == 3:
+            valid = valid.unsqueeze(1)
+        if coords.shape[1] != 2 or valid.shape[1] != 1:
+            raise ValueError(
+                'GAR-DCN coordinates/mask must have 2 and 1 channels.')
+
+        coords = torch.nan_to_num(coords, nan=0.0, posinf=1.0, neginf=0.0)
+        radius_maps = {}
+        confidence_maps = {}
+        for level, target_size in target_sizes.items():
+            target_h, target_w = target_size
+            coords_level = F.interpolate(
+                coords, size=target_size, mode='nearest')
+            valid_level = F.interpolate(
+                valid, size=target_size, mode='nearest').clamp(0.0, 1.0)
+
+            coords_pixels = torch.cat([
+                coords_level[:, 0:1] * max(target_w - 1, 1),
+                coords_level[:, 1:2] * max(target_h - 1, 1),
+            ], dim=1)
+            horizontal_delta = (
+                coords_pixels[:, :, :, 1:] - coords_pixels[:, :, :, :-1])
+            vertical_delta = (
+                coords_pixels[:, :, 1:, :] - coords_pixels[:, :, :-1, :])
+            horizontal_span = torch.sqrt(
+                horizontal_delta.square().sum(dim=1, keepdim=True) + 1e-12)
+            vertical_span = torch.sqrt(
+                vertical_delta.square().sum(dim=1, keepdim=True) + 1e-12)
+            horizontal_valid = (
+                valid_level[:, :, :, 1:] * valid_level[:, :, :, :-1])
+            vertical_valid = (
+                valid_level[:, :, 1:, :] * valid_level[:, :, :-1, :])
+
+            span_sum = (
+                F.pad(horizontal_span * horizontal_valid, (1, 0, 0, 0))
+                + F.pad(horizontal_span * horizontal_valid, (0, 1, 0, 0))
+                + F.pad(vertical_span * vertical_valid, (0, 0, 1, 0))
+                + F.pad(vertical_span * vertical_valid, (0, 0, 0, 1)))
+            support_count = (
+                F.pad(horizontal_valid, (1, 0, 0, 0))
+                + F.pad(horizontal_valid, (0, 1, 0, 0))
+                + F.pad(vertical_valid, (0, 0, 1, 0))
+                + F.pad(vertical_valid, (0, 0, 0, 1)))
+            local_span = span_sum / support_count.clamp_min(1.0)
+            local_span = local_span.clamp(
+                self.gar_dcn_extent_min, self.gar_dcn_extent_max)
+
+            if depth_guidance is None:
+                depth_confidence = torch.ones_like(valid_level)
+            else:
+                depth_confidence = self._build_depth_edge_confidence(
+                    depth_guidance, target_size)
+            support_confidence = (support_count / 4.0).clamp(0.0, 1.0)
+            geometry_reliability = depth_confidence * support_confidence
+            has_local_support = support_count >= 2.0
+
+            candidate_radius = (
+                self.gar_dcn_base_radius * local_span).clamp(
+                    self.gar_dcn_radius_min, self.gar_dcn_radius_max)
+            radius = self.gar_dcn_base_radius + geometry_reliability * (
+                candidate_radius - self.gar_dcn_base_radius)
+            use_adaptive_radius = (valid_level > 0.5) & has_local_support
+            radius = torch.where(
+                use_adaptive_radius, radius,
+                torch.full_like(radius, self.gar_dcn_base_radius))
+
+            confidence = self.gar_dcn_mask_floor + (
+                1.0 - self.gar_dcn_mask_floor) * geometry_reliability
+            confidence = torch.where(
+                valid_level > 0.5, confidence, torch.ones_like(confidence))
+            radius_maps[level] = radius
+            confidence_maps[level] = confidence.clamp(0.0, 1.0)
+
+        return radius_maps, confidence_maps
 
     def forward(self, dense_features, img_ref_hr, depth_guidance=None,
                 projected_ref_coords=None, geometry_valid_mask=None,
@@ -413,6 +524,18 @@ class FlowSimCorrespondenceGenerationArch(nn.Module):
         pre_similarity['relu2_1'] = torch.stack(similarity_relu2, dim=0)
         pre_similarity['relu1_1'] = torch.stack(similarity_relu1, dim=0)
 
+        geometry_radius = None
+        geometry_confidence = None
+        if self.use_geometry_adaptive_dcn:
+            target_sizes = {
+                level: similarity.shape[-2:]
+                for level, similarity in pre_similarity.items()
+            }
+            geometry_radius, geometry_confidence = \
+                self._build_geometry_adaptive_dcn_guidance(
+                    projected_ref_coords, geometry_valid_mask,
+                    depth_guidance, target_sizes)
+
         img_ref_feat = self.vgg(img_ref_hr)
 
         self.matching_aux_losses = {}
@@ -425,7 +548,10 @@ class FlowSimCorrespondenceGenerationArch(nn.Module):
                     auxiliary_confidence_mean).mean(),
             }
 
-        return [pre_offset, pre_flow, pre_similarity], img_ref_feat
+        correspondence = [pre_offset, pre_flow, pre_similarity]
+        if geometry_radius is not None:
+            correspondence.extend([geometry_radius, geometry_confidence])
+        return correspondence, img_ref_feat
 
     def get_matching_aux_losses(self):
         return self.matching_aux_losses
